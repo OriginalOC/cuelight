@@ -1,4 +1,10 @@
 #!/bin/bash
+# Single source of truth for Apache's actual listen port (see
+# docker-overrides/runDocker.sh and apache-overrides/ports.conf) -- derived
+# here too, rather than hardcoded, in case this script runs standalone
+# outside the entrypoint's exported env.
+FPP_WEB_PORT="${FPP_WEB_PORT:-$(grep -oP '^Listen \K[0-9]+' /etc/apache2/ports.conf 2>/dev/null | grep -v '^443$' | head -1)}"
+FPP_WEB_PORT="${FPP_WEB_PORT:-80}"
 
 BINDIR=$(cd $(dirname $0) && pwd)
 
@@ -123,7 +129,7 @@ compileBinaries
 BUILD_RC=$?
 
 # Delete any statistics
-/usr/bin/curl -X DELETE http://localhost/api/statistics/usage
+/usr/bin/curl -X DELETE http://localhost:${FPP_WEB_PORT}/api/statistics/usage
 
 # If apache config file has changed copy across from branch standard
 if [ -f "${FPPDIR}/etc/apache2.site" ] && ! cmp -s "${FPPDIR}/etc/apache2.site" /etc/apache2/sites-available/000-default.conf

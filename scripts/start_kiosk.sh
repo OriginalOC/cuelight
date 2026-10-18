@@ -1,4 +1,10 @@
 #!/usr/bin/bash
+# Single source of truth for Apache's actual listen port (see
+# docker-overrides/runDocker.sh and apache-overrides/ports.conf) -- derived
+# here too, rather than hardcoded, in case this script runs standalone
+# outside the entrypoint's exported env.
+FPP_WEB_PORT="${FPP_WEB_PORT:-$(grep -oP '^Listen \K[0-9]+' /etc/apache2/ports.conf 2>/dev/null | grep -v '^443$' | head -1)}"
+FPP_WEB_PORT="${FPP_WEB_PORT:-80}"
 BINDIR=$(cd $(dirname $0) && pwd)
 . ${BINDIR}/common
 # The page the kiosk shows comes from the KioskUrl setting.  fppinit's
@@ -8,7 +14,7 @@ BINDIR=$(cd $(dirname $0) && pwd)
 # Read the setting and pass it through instead.
 KIOSK_URL=$(getSetting KioskUrl)
 if [ "x$KIOSK_URL" == "x" ]; then
-    KIOSK_URL="http://localhost/"
+    KIOSK_URL="http://localhost:${FPP_WEB_PORT}/"
 fi
 
 TIMEOUT=$(getSetting KioskTimeout)

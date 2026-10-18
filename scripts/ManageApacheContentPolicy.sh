@@ -1,4 +1,10 @@
 #!/bin/bash
+# Single source of truth for Apache's actual listen port (see
+# docker-overrides/runDocker.sh and apache-overrides/ports.conf) -- derived
+# here too, rather than hardcoded, in case this script runs standalone
+# outside the entrypoint's exported env.
+FPP_WEB_PORT="${FPP_WEB_PORT:-$(grep -oP '^Listen \K[0-9]+' /etc/apache2/ports.conf 2>/dev/null | grep -v '^443$' | head -1)}"
+FPP_WEB_PORT="${FPP_WEB_PORT:-80}"
 ##############################################################################
 # Some internal setup
 PATH="/sbin:/bin:/usr/sbin:/usr/bin"
@@ -186,7 +192,7 @@ detect_systems_domainname() {
 
 #function to retrieve IPs from fppd discovered multisync devices
 extract_fppd_multisync_ips() {
-  fppd_json_data=$(curl -s "http://localhost/api/fppd/multiSyncSystems")
+  fppd_json_data=$(curl -s "http://localhost:${FPP_WEB_PORT}/api/fppd/multiSyncSystems")
 
 readarray -t systems < <(echo "$fppd_json_data" | jq -c '.systems[]')
 

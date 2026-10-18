@@ -1,4 +1,10 @@
 #!/bin/bash
+# Single source of truth for Apache's actual listen port (see
+# docker-overrides/runDocker.sh and apache-overrides/ports.conf) -- derived
+# here too, rather than hardcoded, in case this script runs standalone
+# outside the entrypoint's exported env.
+FPP_WEB_PORT="${FPP_WEB_PORT:-$(grep -oP '^Listen \K[0-9]+' /etc/apache2/ports.conf 2>/dev/null | grep -v '^443$' | head -1)}"
+FPP_WEB_PORT="${FPP_WEB_PORT:-80}"
 
 BINDIR=$(cd $(dirname $0) && pwd)
 
@@ -93,7 +99,7 @@ compileBinaries
 BUILD_RC=$?
 
 # Delete any statistics
-/usr/bin/curl -X DELETE http://localhost/api/statistics/usage
+/usr/bin/curl -X DELETE http://localhost:${FPP_WEB_PORT}/api/statistics/usage
 
 # Clear the cached "what version/commit am I on" lookups so the web UI
 # reflects the upgrade immediately instead of waiting out their ~20-90s TTLs
@@ -115,7 +121,7 @@ rm -f /tmp/cache_local_git_version.cache /tmp/cache_local_git_commit_date.cache 
 # upgrade to pay for it -- fppstats_commits involves a real network call to
 # fppstats.falconchristmas.com (up to ~5s on a slow/unreachable host), and
 # nothing needs to see the outcome here, so this is fire-and-forget.
-/usr/bin/curl -s -o /dev/null http://localhost/api/system/updateStatus &
+/usr/bin/curl -s -o /dev/null http://localhost:${FPP_WEB_PORT}/api/system/updateStatus &
 
 if [ "${GITSWITCHOK}" != "1" ]; then
     echo "ERROR: upgrade to '$1' FAILED -- still on branch $(cd "${FPPDIR}" && git rev-parse --abbrev-ref HEAD 2>/dev/null)"

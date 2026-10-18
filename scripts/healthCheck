@@ -1,4 +1,10 @@
 #!/bin/bash
+# Single source of truth for Apache's actual listen port (see
+# docker-overrides/runDocker.sh and apache-overrides/ports.conf) -- derived
+# here too, rather than hardcoded, in case this script runs standalone
+# outside the entrypoint's exported env.
+FPP_WEB_PORT="${FPP_WEB_PORT:-$(grep -oP '^Listen \K[0-9]+' /etc/apache2/ports.conf 2>/dev/null | grep -v '^443$' | head -1)}"
+FPP_WEB_PORT="${FPP_WEB_PORT:-80}"
 
 COMMON_PATH=$(dirname "$0")            # relative
 COMMON_PATH=$(cd "$COMMON_PATH" && pwd)
@@ -146,7 +152,7 @@ HC_Scheduler() {
 HC_HostName() {
     PrintItemHead "HostName is unique"
 
-    FPPHOSTNAMES=$(curl -s http://127.0.0.1/api/fppd/multiSyncSystems | sed -e "s/},/}\n/g" | grep fppMode | sed -e 's/\(.*\)"hostname":"\([^"]*\)"\(.*\)/\2/' | grep -i "^fpp$" | wc -l)
+    FPPHOSTNAMES=$(curl -s http://127.0.0.1:${FPP_WEB_PORT}/api/fppd/multiSyncSystems | sed -e "s/},/}\n/g" | grep fppMode | sed -e 's/\(.*\)"hostname":"\([^"]*\)"\(.*\)/\2/' | grep -i "^fpp$" | wc -l)
     HOSTNAME=$(getSetting HostName)
 
     if [ ${FPPHOSTNAMES} -gt 1 ]
@@ -394,7 +400,7 @@ HC_Warnings() {
 # level ("something was installed while the plugin list was unreachable") renders
 # as a plain pass with explanatory text rather than as a failure.
 HC_PluginSource() {
-    PLUGINSOURCE=$(curl -s --max-time 3 http://127.0.0.1/api/plugin/source)
+    PLUGINSOURCE=$(curl -s --max-time 3 http://127.0.0.1:${FPP_WEB_PORT}/api/plugin/source)
     if [ "x${PLUGINSOURCE}" = "x" ]; then
         return
     fi
