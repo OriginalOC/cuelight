@@ -95,3 +95,4 @@ lib/*.so
 plans/
 .devcontainer/
 .github/
+.vscode/
