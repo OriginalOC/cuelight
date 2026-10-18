@@ -4,6 +4,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
+This repo is **CueLight**, a fork of [FalconChristmas/fpp](https://github.com/FalconChristmas/fpp) carrying reliability/portability patches (see README.md and each commit's own message for what's changed). Everything below describes the underlying FPP codebase, which is almost entirely unmodified — it applies here exactly as it would upstream.
+
 FPP (Falcon Player) is a lightweight, optimized sequence player for LED lighting control, designed for Raspberry Pi and BeagleBone SBCs. It speaks E1.31, DDP, DMX, ArtNet, KiNet, Pixelnet, and Renard protocols and can drive LED panels and WS2811 pixel strings via hardware capes. It also supports MQTT for remote control and integration.
 
 ## Build System

@@ -1,5 +1,11 @@
 # Security Policy
 
+This fork (CueLight) carries its own patches on top of upstream FPP. A vulnerability in
+unmodified FPP code should go to [FalconChristmas/fpp](https://github.com/FalconChristmas/fpp)
+directly; one specific to a CueLight patch should be opened as an issue on this repo. The rest
+of this policy (reporting via normal GitHub issues, no embargo expectation) applies equally to
+both.
+
 ## Supported Versions
 In general, the FPP team only supports the "latest release".   Any bug fixes
 are likely to only be done on the master branch and possibly ported to the 
