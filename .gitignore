@@ -94,3 +94,4 @@ lib/*.so
 .wolf/
 plans/
 .devcontainer/
+.github/
