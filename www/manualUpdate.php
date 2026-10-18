@@ -111,9 +111,21 @@ if ($return_val === 0 || $buildFailed || $unreachableRebuilt) {
   }
 
   if ($needCopy) {
-    UpgradeEchoLog('fpp-update', $upgradeTarget, "Updating Apache config...\n");
-    // Use sudo if needed for permissions
-    system("$SUDO cp $srcConf $dstConf");
+    // $dstConf can be a read-only bind mount (a deliberate local override,
+    // e.g. apache-overrides/000-default.conf) -- in that case $needCopy is
+    // permanently true (hashes will never match) and the cp below would
+    // fail every single update, silently, since its exit status was never
+    // checked. Detect that case up front and say so plainly instead.
+    if (!is_writable($dstConf)) {
+      UpgradeEchoLog('fpp-update', $upgradeTarget, "Apache config differs from stock, but $dstConf is read-only (local override in place) -- skipping, not copying over it.\n");
+    } else {
+      UpgradeEchoLog('fpp-update', $upgradeTarget, "Updating Apache config...\n");
+      // Use sudo if needed for permissions
+      system("$SUDO cp $srcConf $dstConf", $copyRC);
+      if ($copyRC !== 0) {
+        UpgradeEchoLog('fpp-update', $upgradeTarget, "WARNING: Apache config copy failed (exit $copyRC).\n");
+      }
+    }
   } else {
     UpgradeEchoLog('fpp-update', $upgradeTarget, "Apache config is already up to date.\n");
   }
@@ -122,7 +134,7 @@ if ($return_val === 0 || $buildFailed || $unreachableRebuilt) {
 
   system($SUDO . " $fppDir/scripts/fppd_restart");
 
-  system($SUDO . " $fppDir/scripts/ManageApacheContentPolicy regenerate");
+  system($SUDO . " $fppDir/scripts/ManageApacheContentPolicy.sh regenerate");
 
   if (file_exists($settings['statsFile'])) {
     unlink($settings['statsFile']);
