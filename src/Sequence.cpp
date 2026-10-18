@@ -313,6 +313,114 @@ void Sequence::ClearMissingSequenceWarning() {
     m_missingSeqFilename.clear();
 }
 
+// Sequence names arrive from playlists, play commands, and multisync sync
+// packets -- i.e. from any remote on the network -- and the path built from one
+// is handed to checkForReplacementFile() (unlink + rename) and
+// FSEQFile::openFSEQFile(), so a rogue remote or crafted playlist must not be
+// able to escape the sequences directory with it.
+//
+// A name may name a subdirectory of the sequences directory
+// ("halloween/halloween-chase.fseq"); the previous guard refused that because
+// it refused every '/'.  Allowing the separator must not buy traversal, so the
+// check is in two layers:
+//
+//   1. A lexical component scan.  Every '/'-separated component must be
+//      non-empty and must be neither "." nor "..".  That rejects a leading '/'
+//      (absolute path, empty first component), a trailing '/' (no filename,
+//      empty last component), "//" (empty middle component), "../x",
+//      "a/../../etc/passwd", and bare "." or "..".  Backslashes (Windows-style
+//      separators, which would be a traversal vector on a future port and are
+//      never legitimate in a name here) and NUL bytes (which would otherwise
+//      be truncated away by the c_str() calls below, making the string that is
+//      validated differ from the path that is opened) are still refused
+//      outright.
+//
+//   2. For a name that actually contains a '/', realpath() canonicalisation of
+//      the directory it resolves to, compared against the canonicalised
+//      sequences directory.  This is strictly stronger than any amount of
+//      string matching: the kernel does the resolution, so it cannot be fooled
+//      by encoding, by a count of ".." segments, or by symlinks -- a
+//      "halloween -> /etc" symlink planted in the sequences directory is
+//      caught even though its name is lexically spotless, which the old
+//      substring guard would not have caught had a '/' ever been permitted.
+//      The comparison demands either exact equality with the canonical
+//      sequences directory or a prefix whose boundary character is '/', so a
+//      sibling directory such as "/home/fpp/media/sequences-evil" cannot slip
+//      through as a string prefix of "/home/fpp/media/sequences".
+//
+// realpath() requires the path to exist, and a *missing* sequence must still
+// reach the "does not exist" warning and the REMOTE_MODE fallback below rather
+// than be misreported as an invalid name, so only the directory part is
+// canonicalised -- it has to exist for anything in it to be openable -- and
+// the final component is left alone.  Layer 1 has already established that the
+// final component is a single path element, so it cannot move the result out
+// of the canonicalised directory.  A symlinked .fseq *file* inside the
+// sequences tree therefore keeps resolving exactly as it does today; that is
+// deliberate, and it is not a traversal vector under this threat model, since
+// planting such a symlink needs write access inside the sequences directory
+// and anyone holding that can simply drop a real sequence there instead.
+static bool SequenceNameIsSafe(const std::string& filename) {
+    if (filename.find('\\') != std::string::npos ||
+        filename.find('\0') != std::string::npos) {
+        return false;
+    }
+
+    // Layer 1: component scan.
+    size_t pos = 0;
+    while (true) {
+        const size_t slash = filename.find('/', pos);
+        const size_t end = (slash == std::string::npos) ? filename.size() : slash;
+        const std::string component = filename.substr(pos, end - pos);
+        if (component.empty() || component == "." || component == "..") {
+            return false;
+        }
+        if (slash == std::string::npos) {
+            break;
+        }
+        pos = slash + 1;
+    }
+
+    const size_t lastSlash = filename.rfind('/');
+    if (lastSlash == std::string::npos) {
+        // Flat name: lexically a single component, so it cannot leave the
+        // sequences directory and there is nothing for realpath() to add.
+        // Skipping it here also keeps the pre-existing flat-name behaviour
+        // bit-for-bit, including on a system whose media directory does not
+        // exist yet, where canonicalising it would fail every open.
+        return true;
+    }
+
+    // Layer 2: canonicalise the directory the name resolves to.
+    const std::string seqDir = FPP_DIR_SEQUENCE("");
+    const std::string candidateDir = seqDir + "/" + filename.substr(0, lastSlash);
+
+    char* canonSeqDir = realpath(seqDir.c_str(), nullptr);
+    if (canonSeqDir == nullptr) {
+        LogErr(VB_SEQUENCE, "Could not canonicalize sequence directory '%s': %s\n",
+               seqDir.c_str(), strerror(errno));
+        return false;
+    }
+    char* canonCandidate = realpath(candidateDir.c_str(), nullptr);
+    if (canonCandidate == nullptr) {
+        // No such subdirectory.  Nothing to canonicalise means nothing we can
+        // vouch for, so refuse rather than guess.
+        LogDebug(VB_SEQUENCE, "Could not canonicalize sequence subdirectory '%s': %s\n",
+                 candidateDir.c_str(), strerror(errno));
+        free(canonSeqDir);
+        return false;
+    }
+
+    const std::string base(canonSeqDir);
+    const std::string resolved(canonCandidate);
+    free(canonSeqDir);
+    free(canonCandidate);
+
+    return resolved == base ||
+           (resolved.size() > base.size() &&
+            resolved.compare(0, base.size(), base) == 0 &&
+            resolved[base.size()] == '/');
+}
+
 int Sequence::OpenSequenceFile(const std::string& filename, int startFrame, int startSecond) {
     LogDebug(VB_SEQUENCE, "OpenSequenceFile(%s, %d, %d)\n", filename.c_str(), startFrame, startSecond);
 
@@ -321,15 +429,9 @@ int Sequence::OpenSequenceFile(const std::string& filename, int startFrame, int 
         return 0;
     }
 
-    // Sequence names are flat files inside the sequences directory -- they
-    // arrive from playlists, play commands, and multisync sync packets, so a
-    // rogue remote or crafted playlist must not escape via ../ (which would
-    // reach checkForReplacementFile()'s unlink/rename below), pick absolute
-    // paths, or smuggle NULs past the c_str() calls. Reject up front, before
-    // any teardown, the same way empty names are rejected.
-    if (filename.find_first_of("/\\") != std::string::npos ||
-        filename.find("..") != std::string::npos ||
-        filename.find('\0') != std::string::npos) {
+    // Reject up front, before any teardown, the same way empty names are
+    // rejected.  See SequenceNameIsSafe() above for what is allowed and why.
+    if (!SequenceNameIsSafe(filename)) {
         // The missing-sequence warning state is guarded by m_sequenceLock.
         // Leave m_seqStarting alone: a sequence that is open but not yet
         // started must not be flipped to "running" by a rejected request.

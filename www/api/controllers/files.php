@@ -806,18 +806,46 @@ function GetFileImpl($dir, $filename, $lines, $play, $attach)
  * Locates a file within a directory, trying the raw name, URL-decoded name,
  * sanitized name, and ISO-8859-1 to UTF-8 conversion in order.
  *
- * @param string $dir      Absolute directory path to search in.
- * @param string $filename Filename to locate.
+ * @param string $dir         Absolute directory path to search in.
+ * @param string $filename    Filename to locate.
+ * @param bool   $allowSubdir When false (default, and the behavior every
+ *                             pre-existing caller still gets), $filename
+ *                             must be a single bare path component -- any
+ *                             '/' makes it invalid, matching the original,
+ *                             stricter contract those callers rely on. When
+ *                             true, $filename may be a '/'-separated
+ *                             subdirectory-qualified path (e.g.
+ *                             "halloween/halloween-chase.fseq"); a leading
+ *                             '/' (absolute path), a '..' or empty segment
+ *                             (parent traversal / "//"), a backslash, or a
+ *                             NUL byte are still always rejected either way.
  * @return string The resolved filename (possibly transformed), or the original if not found.
  */
-function findFile($dir, $filename)
+function findFile($dir, $filename, $allowSubdir = false)
 {
-    // Only ever a file directly in $dir.  The variants below decode the name
-    // again, so a "%2F" or "..%2F" that was a single path segment to the router
-    // can turn into a separator here; such a candidate is skipped, and a name
-    // that is not a bare filename at all gives false.
-    $bare = function ($f) {
-        return is_string($f) && $f !== '' && $f !== '.' && $f !== '..' && strpbrk($f, "/\\\0") === false;
+    // Only ever a file directly in $dir, unless $allowSubdir allows a
+    // '/'-qualified subdirectory path -- and even then, never one that
+    // escapes $dir. The variants below decode the name again, so a "%2F" or
+    // "..%2F" that was a single path segment to the router can turn into a
+    // separator (or a ".." segment) here; such a candidate is caught by the
+    // same checks, and a name that is not an allowed (sub)path at all gives
+    // false.
+    $bare = function ($f) use ($allowSubdir) {
+        if (!is_string($f) || $f === '' || strpbrk($f, "\\\0") !== false) {
+            return false;
+        }
+        if (!$allowSubdir) {
+            return $f !== '.' && $f !== '..' && strpos($f, '/') === false;
+        }
+        if ($f[0] === '/') {
+            return false; // absolute path
+        }
+        foreach (explode('/', $f) as $segment) {
+            if ($segment === '' || $segment === '.' || $segment === '..') {
+                return false; // "//", "./", or parent-traversal segment
+            }
+        }
+        return true;
     };
     $candidates = array($filename, urldecode($filename));
     $tempFile = sanitizeFilename($filename);
@@ -829,7 +857,15 @@ function findFile($dir, $filename)
         $candidates[] = urldecode($tempFile);
     }
     foreach ($candidates as $candidate) {
-        if ($bare($candidate) && file_exists($dir . "/" . $candidate)) {
+        // is_file(), not file_exists(): file_exists() is also true for a
+        // directory, and sanitizeFilename() strips (rather than rejects) a
+        // disallowed trailing '/', so e.g. "halloween/" => "halloween" --
+        // which, with $allowSubdir true, could otherwise resolve to the
+        // "halloween" *subdirectory* itself rather than being rejected.
+        // That candidate was never reachable before $allowSubdir existed
+        // (no prior caller could get a bare '/' this deep), so this stays
+        // tightened for every caller rather than gated behind the flag.
+        if ($bare($candidate) && is_file($dir . "/" . $candidate)) {
             return $candidate;
         }
     }

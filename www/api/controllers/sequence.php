@@ -3,12 +3,14 @@
 /**
  * Get all sequences
  *
- * Returns a list of all `*.fseq` sequence files.
+ * Returns a list of all `*.fseq` sequence files. Scans subdirectories too;
+ * names for those come back subdirectory-qualified (e.g.
+ * "halloween/halloween-chase"), with no leading slash and no ".fseq".
  *
  * @route GET /api/sequence
  * @response 200 List of sequence names
  * ```json
- * ["GreatestShow", "StPatricksDay", "Valentine"]
+ * ["GreatestShow", "StPatricksDay", "Valentine", "halloween/halloween-chase"]
  * ```
  */
 function GetSequences()
@@ -17,9 +19,28 @@ function GetSequences()
     $sequences = array();
 
     $dir = $settings['sequenceDirectory'];
-    foreach (glob($dir . "/*.fseq") as $filename) {
-        array_push($sequences, basename($filename, ".fseq"));
+    $dirReal = realpath($dir);
+    if ($dirReal !== false) {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator($dirReal, FilesystemIterator::SKIP_DOTS),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+        foreach ($iterator as $fileInfo) {
+            if (!$fileInfo->isFile()) {
+                continue;
+            }
+            if ($fileInfo->getExtension() !== 'fseq') {
+                continue;
+            }
+            // Path relative to $dirReal, qualified with any subdirectories,
+            // using '/' regardless of platform, with ".fseq" stripped.
+            $relative = substr($fileInfo->getPathname(), strlen($dirReal) + 1);
+            $relative = str_replace(DIRECTORY_SEPARATOR, '/', $relative);
+            $name = substr($relative, 0, -strlen('.fseq'));
+            array_push($sequences, $name);
+        }
     }
+    sort($sequences);
 
     return json($sequences);
 }
@@ -48,7 +69,7 @@ function GetSequence()
         $sequence = $sequence . ".fseq";
     }
     $dir = FSeqOrEseqDirectory($sequence);
-    $name = findFile($dir, $sequence);
+    $name = findFile($dir, $sequence, true);
     if ($name === false) {
         http_response_code(400);
         return json(array('Status' => 'Error', 'Message' => 'Invalid sequence name.'));
@@ -102,7 +123,7 @@ function GetSequenceMetaData()
         $sequence = $sequence . ".fseq";
     }
     $dir = FSeqOrEseqDirectory($sequence);
-    $name = findFile($dir, $sequence);
+    $name = findFile($dir, $sequence, true);
     if ($name === false) {
         http_response_code(400);
         return json(array('Status' => 'Error', 'Message' => 'Invalid sequence name.'));
@@ -149,7 +170,7 @@ function PostSequence()
         $sequence = $sequence . ".fseq";
     }
     $dir = FSeqOrEseqDirectory($sequence);
-    $name = findFile($dir, $sequence);
+    $name = findFile($dir, $sequence, true);
     if ($name === false) {
         http_response_code(400);
         return json(array('Status' => 'Error', 'Message' => 'Invalid sequence name.'));
@@ -190,7 +211,7 @@ function DeleteSequences()
         $sequence = $sequence . ".fseq";
     }
     $dir = FSeqOrEseqDirectory($sequence);
-    $name = findFile($dir, $sequence);
+    $name = findFile($dir, $sequence, true);
     if ($name === false) {
         http_response_code(400);
         return json(array('Status' => 'Error', 'Message' => 'Invalid sequence name.'));
@@ -242,7 +263,7 @@ function GetSequenceStart()
         $sequence = $sequence . ".fseq";
     }
     $dir = $settings['sequenceDirectory'];
-    $sequence = findFile($dir, $sequence);
+    $sequence = findFile($dir, $sequence, true);
     if ($sequence === false) {
         return json(array("status" => "ERROR: Invalid sequence name"));
     }

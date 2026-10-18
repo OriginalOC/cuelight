@@ -282,11 +282,27 @@ dispatch_get('/sequence', 'GetSequences');
 dispatch_get('/sequence/current/step', 'GetSequenceStep');
 dispatch_get('/sequence/current/stop', 'GetSequenceStop');
 dispatch_get('/sequence/current/togglePause', 'GetSequenceTogglePause');
-dispatch_get('/sequence/:SequenceName', 'GetSequence');
-dispatch_get('/sequence/:SequenceName/meta', 'GetSequenceMetaData');
-dispatch_get('/sequence/:SequenceName/start/:startSecond', 'GetSequenceStart');
-dispatch_post('/sequence/:SequenceName', 'PostSequence');
-dispatch_delete('/sequence/:SequenceName', 'DeleteSequences');
+// SequenceName is matched with the Limonade '**' wildcard segment (rather
+// than ':SequenceName') so it can contain '/' and resolve subdirectory-
+// qualified names like "halloween/halloween-chase". The explicit names
+// array (`array(0 => 'SequenceName')`) pins position 0 of the wildcard
+// capture to the 'SequenceName' param key, same as a ':SequenceName' token
+// would, so params('SequenceName') in sequence.php is unchanged.
+//
+// '**' is greedy (regex `(.*)`), so the more specific /meta and /start
+// routes MUST be registered before the bare download route below --
+// Limonade's route_find() tries routes in registration order and the first
+// pattern that matches wins; the bare route's wildcard would otherwise
+// swallow "/sequence/<name>/meta" and "/sequence/<name>/start/<n>" paths
+// before they ever reached their intended handlers. Verified with
+// route_find() directly against this exact route table (GET/POST/DELETE,
+// multi-segment and flat names, plus the existing /sequence/current/* and
+// bare /sequence literal routes) before deploying.
+dispatch_get(array('/sequence/**/meta', array(0 => 'SequenceName')), 'GetSequenceMetaData');
+dispatch_get(array('/sequence/**/start/:startSecond', array(0 => 'SequenceName')), 'GetSequenceStart');
+dispatch_get(array('/sequence/**', array(0 => 'SequenceName')), 'GetSequence');
+dispatch_post(array('/sequence/**', array(0 => 'SequenceName')), 'PostSequence');
+dispatch_delete(array('/sequence/**', array(0 => 'SequenceName')), 'DeleteSequences');
 
 dispatch_post('/schedule/reload', 'ReloadSchedule');
 dispatch_get('/schedule', 'GetSchedule');
