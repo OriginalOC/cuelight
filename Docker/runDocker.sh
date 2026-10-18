@@ -54,6 +54,10 @@ WATCHDOG_LOG=/home/fpp/media/logs/daemon-watchdog.log
             rm -f /run/avahi-daemon/pid
             avahi-daemon --daemonize
         fi
+        if ! pgrep -x chronyd >/dev/null; then
+            echo "$(date -Is) chronyd down, restarting" >> "$WATCHDOG_LOG"
+            chronyd -x
+        fi
     done
 ) &
 
@@ -61,6 +65,22 @@ WATCHDOG_LOG=/home/fpp/media/logs/daemon-watchdog.log
 # it, /etc/logrotate.d/fpp_apache2_logs and fpp_other_logs never run, and the
 # bind-mounted media/logs/*.log grow unbounded on the host disk.
 cron
+
+# chronyd is installed but, same pattern again, never started -- FPP's own
+# healthCheck requires `timedatectl` (needs systemd as PID 1, which this
+# container doesn't have) OR a running chronyd to report time-sync status,
+# so it always failed with "NTP daemon not running" regardless of whether
+# the HOST's clock is correct.
+#
+# -x (don't adjust the system clock) is not a capability workaround here --
+# it's the correct mode for network_mode: host. The container shares the
+# host's actual kernel clock, which the host's own time-sync (e.g.
+# systemd-timesyncd) already keeps correct; chronyd adjusting it too would
+# just be two daemons fighting over the same clock. Track-and-report only.
+chronyd -x
+if ! pgrep -x chronyd >/dev/null; then
+    echo "$(date -Is) chronyd failed to start" >> /home/fpp/media/logs/daemon-watchdog.log
+fi
 
 # Single source of truth for "what port is Apache actually on" for the shell
 # scripts patched below (shell-overrides/*) -- read once here from the same
