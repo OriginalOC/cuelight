@@ -78,7 +78,7 @@ function GetPluginHeaderIndicators()
 
         // Try to call the plugin's headerIndicator endpoint
         try {
-            $url = "http://localhost/api/plugin/{$pluginName}/headerIndicator";
+            $url = FPPSelfBaseURL() . "/api/plugin/{$pluginName}/headerIndicator";
 
             $ch = curl_init($url);
             curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);

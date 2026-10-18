@@ -140,9 +140,9 @@ function stats_network()
     // that may have statistics disabled entirely.  If an "can this box reach the
     // internet" metric is wanted, it has to come from the update check, which
     // already makes that request for its own reasons, not from here.
-    $rc['wifi'] = json_decode(file_get_contents("http://localhost/api/network/wifi/strength"), true);
+    $rc['wifi'] = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/network/wifi/strength"), true);
 
-    $interfaces = json_decode(file_get_contents("http://localhost/api/network/interface"), true);
+    $interfaces = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/network/interface"), true);
     $anyV4 = false;
     $anyV6 = false;
     foreach ($interfaces as $i) {
@@ -654,7 +654,7 @@ function validateAndAdd(&$obj, &$input, &$mapping)
 function stats_getSystemInfo()
 {
     $rc = array();
-    $data = json_decode(file_get_contents("http://localhost/api/system/status"), true);
+    $data = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/system/status"), true);
     $mapping = array(
         "mqtt" => "MQTT",
         "fppdStatus" => "fppd",
@@ -696,7 +696,7 @@ function stats_getSystemInfo()
 function stats_getOutputProcessors()
 {
     $rc = array();
-    $data = json_decode(file_get_contents("http://localhost/api/channel/output/processors"), true);
+    $data = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/channel/output/processors"), true);
     if (isset($data['outputProcessors'])) {
         foreach ($data['outputProcessors'] as $obj) {
             $type = $obj['type'];
@@ -724,7 +724,7 @@ function stats_getFiles()
     $types = array("sequences", "effects", "music", "videos");
     $rc = array();
     foreach ($types as $type) {
-        $data = json_decode(file_get_contents("http://localhost/api/files/$type"), true);
+        $data = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/files/$type"), true);
         if (isset($data['files'])) {
             $cnt = 0;
             $bytes = 0;
@@ -949,7 +949,7 @@ function stats_multiSyncCollect($injected = null)
     // are the parts worth exercising, and they should not need a running fppd.
     $data = ($injected !== null)
         ? $injected
-        : json_decode(file_get_contents("http://localhost/api/fppd/multiSyncSystems"), true);
+        : json_decode(file_get_contents(FPPSelfBaseURL() . "/api/fppd/multiSyncSystems"), true);
     $peers = array();
     $shape = array("rows" => 0, "devices" => 0, "multiAddress" => 0,
         "addressesPerDevice" => array(), "stacks" => array());
@@ -1079,7 +1079,7 @@ function stats_getMultiSyncShape()
  */
 function stats_getSchedule()
 {
-    $data = json_decode(file_get_contents("http://localhost/api/fppd/schedule"), true);
+    $data = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/fppd/schedule"), true);
     $rc = array();
     if (isset($data["schedule"])) {
         $rc["enabled"] = $data["schedule"]["enabled"];
@@ -1108,7 +1108,7 @@ function stats_getSchedule()
  */
 function stats_getModels()
 {
-    $raw = fetch_api_with_limit("http://localhost/api/models");
+    $raw = fetch_api_with_limit(FPPSelfBaseURL() . "/api/models");
     $data = json_decode($raw, true);
     $rc = array("count" => 0);
     if (is_array($data)) {
@@ -1126,7 +1126,7 @@ function stats_getModels()
 function stats_getPlugins()
 {
     global $settings;
-    $data = json_decode(file_get_contents("http://localhost/api/plugin"), true);
+    $data = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/plugin"), true);
     $rc = array();
     if (is_array($data)) {
         foreach ($data as $plugin) {
@@ -1156,7 +1156,7 @@ function stats_getPlugins()
 function stats_getSequenceShape()
 {
     $rc = array("sequences" => 0, "read" => 0);
-    $raw = @file_get_contents("http://localhost/api/sequence");
+    $raw = @file_get_contents(FPPSelfBaseURL() . "/api/sequence");
     if ($raw === false) {
         return $rc;
     }
@@ -1182,7 +1182,7 @@ function stats_getSequenceShape()
     $compression = array();
     $frames = 0;
     foreach ($names as $name) {
-        $meta = @file_get_contents("http://localhost/api/sequence/" . rawurlencode($name) . "/meta");
+        $meta = @file_get_contents(FPPSelfBaseURL() . "/api/sequence/" . rawurlencode($name) . "/meta");
         if ($meta === false) {
             continue;
         }
@@ -1382,7 +1382,7 @@ function stats_getCapeInfo()
     );
 
     $rc = array("name" => "None");
-    $data = json_decode(file_get_contents("http://localhost/api/cape"), true);
+    $data = json_decode(file_get_contents(FPPSelfBaseURL() . "/api/cape"), true);
     if (($data != false) && ((!isset($data['sendStats'])) || ($data['sendStats'] == 1))) {
         validateAndAdd($rc, $data, $mapping);
         // Reduce the vendor block to the name, matching what peer cape records
@@ -1603,7 +1603,7 @@ function stats_multiSyncPeerLookup()
         return $map;
     }
     $map = array();
-    $raw = @file_get_contents("http://localhost/api/fppd/multiSyncSystems");
+    $raw = @file_get_contents(FPPSelfBaseURL() . "/api/fppd/multiSyncSystems");
     if ($raw === false) {
         return $map;
     }

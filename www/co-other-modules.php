@@ -399,7 +399,7 @@
     var PixelOverlayModels = new Array();
     var PixelOverlayModelChannels = new Array();
     <?
-    $json = file_get_contents('http://localhost/api/models');
+    $json = file_get_contents(FPPSelfBaseURL() . '/api/models');
     $models = json_decode($json, true);
     foreach ($models as $model) {
         $modelName = $model['Name'];

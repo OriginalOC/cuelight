@@ -29,7 +29,7 @@ function GetErrorReportPreview()
     $status = array();
     // Try local API status (same as menuHead.inc:140)
     $ctx = @stream_context_create(array('http' => array('timeout' => 2)));
-    $raw = @file_get_contents('http://127.0.0.1/api/system/status', false, $ctx);
+    $raw = @file_get_contents(FPPSelfBaseURL() . '/api/system/status', false, $ctx);
     if ($raw !== false) {
         $j = @json_decode($raw, true);
         if (isset($j['advancedView']) && is_array($j['advancedView'])) {

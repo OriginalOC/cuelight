@@ -4,9 +4,11 @@
 // into WLED-shaped JSON so the WLED-iOS app and other WLED clients
 // see FPP as a (very minimal) WLED node.
 
+require_once __DIR__ . '/../common.php';
+
 function fpp_curl_json($path, $timeout = 2)
 {
-    $ch = curl_init('http://127.0.0.1' . $path);
+    $ch = curl_init(FPPSelfBaseURL() . $path);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, $timeout);
     curl_setopt($ch, CURLOPT_CONNECTTIMEOUT, 1);

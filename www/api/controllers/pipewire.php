@@ -2033,7 +2033,7 @@ function StopSyncCalibrationInternal()
 
     // Also stop any legacy fppd-driven click track in case an older session
     // started one before this fix shipped.
-    $url = 'http://localhost/api/command/Stop%20Media/fpp_sync_click.wav';
+    $url = FPPSelfBaseURL() . '/api/command/Stop%20Media/fpp_sync_click.wav';
     $ctx = stream_context_create(array('http' => array('method' => 'GET', 'timeout' => 5)));
     @file_get_contents($url, false, $ctx);
 }
@@ -8561,7 +8561,7 @@ function GetVideoOverlayModels()
 {
     $models = array();
     $ctx = stream_context_create(array('http' => array('timeout' => 2)));
-    $json = @file_get_contents('http://localhost/api/overlays/models', false, $ctx);
+    $json = @file_get_contents(FPPSelfBaseURL() . '/api/overlays/models', false, $ctx);
     if ($json === false)
         return $models;
 

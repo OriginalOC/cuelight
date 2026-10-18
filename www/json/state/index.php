@@ -24,7 +24,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' || $_SERVER['REQUEST_METHOD'] === 'PUT
             // on/off → state Enabled (1) or Disabled (0)
             if (array_key_exists('on', $s)) {
                 $newState = $s['on'] ? 1 : 0;
-                $url = 'http://127.0.0.1/api/overlays/model/' . rawurlencode($modelName) . '/state';
+                $url = FPPSelfBaseURL() . '/api/overlays/model/' . rawurlencode($modelName) . '/state';
                 $payload = json_encode(['State' => $newState]);
                 $ch = curl_init($url);
                 curl_setopt_array($ch, [
@@ -45,7 +45,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' || $_SERVER['REQUEST_METHOD'] === 'PUT
         foreach (fpp_overlay_models() as $m) {
             $modelName = $m['Name'] ?? ($m['name'] ?? null);
             if (!$modelName) continue;
-            $url = 'http://127.0.0.1/api/overlays/model/' . rawurlencode($modelName) . '/state';
+            $url = FPPSelfBaseURL() . '/api/overlays/model/' . rawurlencode($modelName) . '/state';
             $payload = json_encode(['State' => $body['on'] ? 1 : 0]);
             $ch = curl_init($url);
             curl_setopt_array($ch, [

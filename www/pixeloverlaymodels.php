@@ -48,7 +48,7 @@ if (($settings['Platform'] == "Linux") && (file_exists('/usr/include/X11/Xlib.h'
 
         var PixelOverlayModels = new Array();
         <?
-        $json = file_get_contents('http://localhost/api/models?simple=true');
+        $json = file_get_contents(FPPSelfBaseURL() . '/api/models?simple=true');
         $models = json_decode($json, true);
         foreach ($models as $model) {
             // User data inside a script: see co-other-modules.php.

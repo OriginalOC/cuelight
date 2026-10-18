@@ -1187,7 +1187,7 @@ function processRestoreData($restore_area, $restore_area_data, $backup_version)
                             //
                             $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
                             //Apply timezone settings via API
-                            $url = 'http://localhost/api/settings/TimeZone';
+                            $url = FPPSelfBaseURL() . '/api/settings/TimeZone';
                             //options for the request
                             $options = array(
                                 'http' => array(
@@ -2380,7 +2380,7 @@ function pruneOrRemoveAgedBackupFiles()
     global $fpp_backup_max_age, $fpp_backup_min_number_kept, $fpp_backup_max_plugin_backups_key, $fpp_backup_location, $backups_verbose_logging;
 
     //gets all the files in the configs/backup directory via the API now since it will look in multiple areas
-    $config_dir_files = file_get_contents('http://localhost/api/backups/configuration/list');
+    $config_dir_files = file_get_contents(FPPSelfBaseURL() . '/api/backups/configuration/list');
     $config_dir_files = json_decode($config_dir_files, true);
     $config_dir_files_tmp = $config_dir_files;
     $backups_to_delete = array();
@@ -2456,7 +2456,7 @@ function pruneOrRemoveAgedBackupFiles()
 
             //Remove the file via API instead
             //Build the URL
-            $url = 'http://localhost/api/backups/configuration/' . $backup_directory . '/' . $backup_filename;
+            $url = FPPSelfBaseURL() . '/api/backups/configuration/' . $backup_directory . '/' . $backup_filename;
             //options for the request
             $options = array(
                 'http' => array(

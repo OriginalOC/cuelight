@@ -2403,7 +2403,18 @@
                 );
 
                 if (isFPP(data[i].typeId)) {
-                    fppIpAddresses.push(ip);
+                    // Skip polling ourselves over HTTP: a system that
+                    // announces one of OUR OWN addresses via MultiSync (easy
+                    // to hit with network_mode: host, or just a loopback
+                    // announcement) would otherwise get polled on
+                    // http://<our-own-ip>/api/system/status, port 80 --
+                    // which may not even be where this instance's own
+                    // Apache lives. We already know our own status locally;
+                    // there's nothing to gain by round-tripping through the
+                    // network to ask ourselves.
+                    if (localIps.indexOf(ip) === -1) {
+                        fppIpAddresses.push(ip);
+                    }
                 } else if (isESPixelStick(data[i].typeId)) {
                     // Which firmware generation decides how we ask:
                     //   3.x serves the two-letter command protocol (XJ/G1/G2) on a

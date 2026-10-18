@@ -12,7 +12,7 @@ if (isset($_REQUEST['T'])) {
         if (!$modelName) continue;
         $current = !empty($m['effectRunning']) || (intval($m['isActive'] ?? 0) > 0);
         $new = ($t === 2) ? (!$current ? 1 : 0) : ($t === 1 ? 1 : 0);
-        $url = 'http://127.0.0.1/api/overlays/model/' . rawurlencode($modelName) . '/state';
+        $url = FPPSelfBaseURL() . '/api/overlays/model/' . rawurlencode($modelName) . '/state';
         $payload = json_encode(['State' => $new]);
         $ch = curl_init($url);
         curl_setopt_array($ch, [

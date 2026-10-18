@@ -101,8 +101,11 @@ function GetSetting()
         if (preg_match('/^\//', $sInfo['optionsURL'])) {
             $json = file_get_contents($sInfo['optionsURL']);
         } else {
-            //SERVER_ADDR is an IPv6 literal when the browser reached us over IPv6, which must be bracketed
-            $json = file_get_contents("http://" . fppUrlHost($_SERVER['SERVER_ADDR']) . "/" . $sInfo['optionsURL']);
+            // This is always a self-call (optionsURL is relative to this
+            // instance's own API), so route it through the same SSOT as
+            // every other self-call rather than rebuilding a host:port from
+            // SERVER_ADDR (which carries no port at all).
+            $json = file_get_contents(FPPSelfBaseURL() . "/" . $sInfo['optionsURL']);
         }
 
         $sInfo['options'] = json_decode($json, true);
@@ -384,7 +387,7 @@ function PutSetting()
 
         if ($curl !== '') {
             $backupCmd = escapeshellarg($curl) . ' -s -m 300 -X POST -H "Content-Type: text/plain" --data-binary ' .
-                escapeshellarg($backup_comment) . ' http://localhost/api/backups/configuration';
+                escapeshellarg($backup_comment) . ' ' . FPPSelfBaseURL() . '/api/backups/configuration';
 
             //Run them one at a time.  Changing several settings quickly would
             //otherwise have that many full backups writing at once, which on an SD

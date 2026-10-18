@@ -2388,7 +2388,7 @@ function FPPDPluginLifecycle($plugin, $action)
         'timeout' => 30,
         'ignore_errors' => true,
     )));
-    $url = 'http://localhost/api/fppd/plugin/' . rawurlencode($plugin) . '/' . $action;
+    $url = FPPSelfBaseURL() . '/api/fppd/plugin/' . rawurlencode($plugin) . '/' . $action;
     $resp = @file_get_contents($url, false, $ctx);
     if ($resp === false) {
         // 'answered' tells "fppd is not running" (nothing to change; it loads

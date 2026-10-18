@@ -1,6 +1,17 @@
 <?php
 require_once "config.php";
 
+// Single source of truth for FPP's own internal self-requests (file_get_contents
+// calls back into its own api/pages). $_SERVER['SERVER_PORT'] is Apache's own
+// record of the port THIS request actually arrived on, so self-calls always
+// target wherever Apache really is, rather than every call site separately
+// hardcoding "localhost"/"127.0.0.1" with an implicit, unconfigurable port 80.
+function FPPSelfBaseURL()
+{
+    $port = isset($_SERVER['SERVER_PORT']) ? $_SERVER['SERVER_PORT'] : 80;
+    return 'http://127.0.0.1:' . $port;
+}
+
 function check($var, $var_name = "", $function_name = "")
 {
     global $debug;
@@ -1415,7 +1426,7 @@ function PrintSetting($setting, $callback = '', $options = array(), $plugin = ''
                         $json = "";
                         $url = $s['optionsURL'];
                         if (!preg_match('/^\//', $s['optionsURL'])) {
-                            $url = "http://127.0.0.1/" . $s['optionsURL'];
+                            $url = FPPSelfBaseURL() . "/" . $s['optionsURL'];
                         }
                         $json = file_get_contents($url);
                         $options = json_decode($json, true);
@@ -4090,7 +4101,7 @@ function network_list_interfaces_obj()
 function getKnownFPPSystems()
 {
     $backupHosts = array();
-    $data = file_get_contents('http://localhost/api/fppd/multiSyncSystems');
+    $data = file_get_contents(FPPSelfBaseURL() . '/api/fppd/multiSyncSystems');
     if (false === $data) {
         return $backupHosts;
     }
@@ -5152,7 +5163,7 @@ function RememberBackupMetadata($backup_file_path, $backup_comment, $backup_trig
  */
 function GenerateBackupViaAPI($backup_comment = "Created via API", $trigger_source = null)
 {
-    $url = 'http://localhost/api/backups/configuration';
+    $url = FPPSelfBaseURL() . '/api/backups/configuration';
     $data = $backup_comment;
 
     if (!is_null($trigger_source)) {
@@ -5209,7 +5220,7 @@ function DoJsonBackupToUSB()
         //Make a call to the copystorage.php page (i.e the File Copy Backup page)
 
         //Build up the URL, include the necessary params so we can call it and have JSON Backups copied across
-        $url = 'http://localhost/copystorage.php?wrapped=1&direction=TOUSB&path=' . urlencode($fileCopy_BackupPath) . '&storageLocation=' . $selected_jsonConfigBackupUSBLocation . '&flags=JsonBackups&delete=no';
+        $url = FPPSelfBaseURL() . '/copystorage.php?wrapped=1&direction=TOUSB&path=' . urlencode($fileCopy_BackupPath) . '&storageLocation=' . $selected_jsonConfigBackupUSBLocation . '&flags=JsonBackups&delete=no';
 
         if (file_get_contents($url, false) === false) {
             /* Handle error */
