@@ -93,3 +93,4 @@ lib/*.so
 .claude/
 .wolf/
 plans/
+.devcontainer/
