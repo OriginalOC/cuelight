@@ -80,9 +80,14 @@ public:
     void GetReceiverInfo();
 
 private:
+    void BuildRemap(void);
     void SetHostMACs(void* data);
     int SendMessagesHelper(struct mmsghdr* msgs, int cnt);
-    int SendMessages(std::vector<struct mmsghdr>& msgsToSend);
+    bool SendMessages(std::vector<struct mmsghdr>& msgsToSend);
+    bool FrameFits(void);
+    void NoteDroppedFrame(void);
+    void RaiseSendErrorWarning(int err);
+    void ClearSendErrorWarning(void);
 
     int m_width;
     int m_height;
@@ -97,7 +102,14 @@ private:
     int m_rfd;
     int m_rowSize;
 
-    int m_slowCount;
+    // Send-buffer accounting: what one frame's packets cost the kernel
+    // (payload plus per-packet overhead), and the buffer that holds them
+    int m_frameCharge;
+    int m_sendBufferSize;
+    bool m_frameSent;
+    int m_droppedFrames;
+    long long m_droppedLogTime;
+    std::string m_sendErrorWarning;
 
     int m_panelWidth;
     int m_panelHeight;
@@ -110,6 +122,17 @@ private:
     std::unique_ptr<Matrix> m_matrix;
     std::unique_ptr<PanelMatrix> m_panelMatrix;
     uint8_t m_gammaCurve[256];
+
+    // PrepData()'s remap, flattened by BuildRemap(): the source channel of
+    // each output-frame pixel, in frame order, consumed by runs of pixels
+    // that are contiguous in the frame and share one color order
+    struct RemapRun {
+        uint32_t dst;      // byte offset into m_outputFrame
+        uint32_t count;    // pixels
+        uint32_t order[3]; // channel offset of each output byte from the pixel's base
+    };
+    std::vector<RemapRun> m_remapRuns;
+    std::vector<uint32_t> m_remapSrc;
     int m_flippedLayout;
     bool m_colorlightDisable;
 

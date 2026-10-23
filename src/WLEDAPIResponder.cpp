@@ -44,6 +44,7 @@
 #include "overlays/PixelOverlayEffects.h"
 #include "overlays/PixelOverlayModel.h"
 #include "overlays/WLEDEffects.h"
+#include "SysSocket.h"
 
 WLEDAPIResponder WLEDAPIResponder::INSTANCE;
 
@@ -232,7 +233,7 @@ void WLEDAPIResponder::Initialize() {
     int p = getSettingInt("WLEDAPIPort", 0);
     if (p > 0 && p < 65536) m_port = p;
 
-    m_socket = ::socket(AF_INET, SOCK_STREAM, 0);
+    m_socket = OpenSocket(AF_INET, SOCK_STREAM, 0);
     if (m_socket < 0) {
         LogErr(VB_GENERAL, "WLEDAPIResponder: socket() failed: %s\n", FPPstrerror(errno));
         return;
@@ -310,7 +311,7 @@ void WLEDAPIResponder::AcceptLoop() {
     std::chrono::steady_clock::time_point lastAcceptWarn{};
     int acceptFailures = 0;
     while (m_running) {
-        int client = ::accept(m_socket, nullptr, nullptr);
+        int client = AcceptSocket(m_socket, nullptr, nullptr);
         if (client < 0) {
             int err = errno;
             if (!m_running) {
@@ -700,7 +701,7 @@ std::string WLEDAPIResponder::BuildInfoJson() {
     leds["lc"]     = 1;
     info["leds"] = leds;
 
-    info["fxcount"]  = static_cast<int>(PixelOverlayEffect::GetPixelOverlayEffects().size());
+    info["fxcount"]  = static_cast<int>(WLEDEffect::getWLEDAPIEffectNames().size());
     info["palcount"] = 1;
     {
         std::string mac, ip;
@@ -737,7 +738,7 @@ std::string WLEDAPIResponder::BuildStateJson() {
 
     bool anyOn = false;
     int idx = 0;
-    const auto& effects = PixelOverlayEffect::GetPixelOverlayEffects();
+    const auto& effects = WLEDEffect::getWLEDAPIEffectNames();
     for (const auto& name : PixelOverlayManager::INSTANCE.getModelNamesSnapshot()) {
         auto m = PixelOverlayManager::INSTANCE.getModelShared(name);
         if (!m) continue;
@@ -830,7 +831,7 @@ std::string WLEDAPIResponder::BuildCombinedJson() {
 
 std::string WLEDAPIResponder::BuildEffectsJson() {
     Json::Value arr(Json::arrayValue);
-    for (auto& n : PixelOverlayEffect::GetPixelOverlayEffects()) arr.append(n);
+    for (auto& n : WLEDEffect::getWLEDAPIEffectNames()) arr.append(n);
     return SaveJsonToString(arr, "");
 }
 
@@ -878,7 +879,7 @@ void WLEDAPIResponder::ApplyStatePost(const std::string& jsonBody) {
     }
 
     if (!segList.empty()) {
-        const auto& effList = PixelOverlayEffect::GetPixelOverlayEffects();
+        const auto& effList = WLEDEffect::getWLEDAPIEffectNames();
         std::vector<std::string> effects(effList.begin(), effList.end());
 
         for (const auto& seg : segList) {
@@ -906,6 +907,12 @@ void WLEDAPIResponder::ApplyStatePost(const std::string& jsonBody) {
                     int fxIdx = jsonInt(seg["fx"], -1);
                     if (fxIdx < 0 || fxIdx >= (int)effects.size()) continue;
                     fxName = effects[fxIdx];
+                    if (fxName == "RSVD") {
+                        // A retired effect's number, kept so the ones after
+                        // it don't move.
+                        LogWarn(VB_GENERAL, "WLEDAPIResponder: effect %d is no longer offered -- ignoring\n", fxIdx);
+                        continue;
+                    }
                 } else {
                     // A slider drag or colour pick without "fx" adjusts the
                     // effect that is running. It used to fall back to index

@@ -11,6 +11,7 @@
 #include "../fppversion.h"
 #include "../log.h"
 #include "../settings.h"
+#include "../CurlSocket.h"
 
 #include "FPPStatusOLEDPage.h"
 #include "NetworkOLEDPage.h"
@@ -37,6 +38,7 @@ static std::string escapeURL(const std::string& url) {
 static std::string doCurlGet(const std::string& url, int timeout = 250) {
     const std::string buffer;
     CURL* curl = curl_easy_init();
+    SetCurlCloseOnExec(curl);
     curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
@@ -47,6 +49,13 @@ static std::string doCurlGet(const std::string& url, int timeout = 250) {
     curl_easy_perform(curl);
     curl_easy_cleanup(curl);
     return buffer;
+}
+
+// For the routes that change state, which take POST (GET is deprecated).
+static std::string doCurlPost(const std::string& url, int timeout = 250) {
+    std::string resp;
+    urlHelper("POST", url, "", resp, (timeout + 999) / 1000);
+    return resp;
 }
 
 class RebootPromptPage : public PromptOLEDPage {
@@ -209,7 +218,7 @@ public:
             LogInfo(VB_GENERAL, "Areas: %s\n", areas.c_str());
             std::string url = "http://127.0.0.1/resetConfig.php?areas=" + areas;
             LogInfo(VB_GENERAL, "Reset URL: %s\n", url.c_str());
-            std::string d = doCurlGet(url, 10000);
+            std::string d = doCurlPost(url, 10000);
             LogInfo(VB_GENERAL, "%s\n", d.c_str());
         }
         SetCurrentPage(parent);
@@ -395,7 +404,7 @@ void FPPMainMenu::itemSelected(const std::string& item) {
                     }
                     std::string nvresults;
                     urlPut("http://127.0.0.1/api/settings/fppMode", nv, nvresults);
-                    doCurlGet("http://127.0.0.1/api/system/fppd/restart", 10000);
+                    doCurlPost("http://127.0.0.1/api/system/fppd/restart", 10000);
                     SetCurrentPage(sp);
                 } else {
                     SetCurrentPage(this);
@@ -424,14 +433,14 @@ void FPPMainMenu::itemSelected(const std::string& item) {
                 "Playlist", playlists, [sp](const std::string& item) {
                     if (item == "-Stop Now-") {
                         std::string url = "http://127.0.0.1/api/playlists/stop";
-                        doCurlGet(url, 1000);
+                        doCurlPost(url, 1000);
                     } else if (item == "-Stop Gracefully-") {
                         std::string url = "http://127.0.0.1/api/playlists/stopgracefully";
-                        doCurlGet(url, 1000);
+                        doCurlPost(url, 1000);
                     } else if (item != "Back") {
                         std::string escItem = escapeURL(item);
                         std::string url = "http://127.0.0.1/api/playlist/" + escItem + "/start";
-                        doCurlGet(url, 1000);
+                        doCurlPost(url, 1000);
                     }
                     SetCurrentPage(sp);
                 },

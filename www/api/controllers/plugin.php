@@ -489,7 +489,9 @@ function SetPluginRepoRecords($setting, $pending)
 			return str_replace(array(',', '|'), '', is_string($v) ? $v : '');
 		};
 		$repoName = $clean($p['repoName']);
-		$srcURL = $clean(isset($p['srcURL']) ? $p['srcURL'] : '');
+		// Without credentials, as the install history stores it: these
+		// settings are served by the settings API and kept in every backup.
+		$srcURL = $clean(PluginHistoryURL(isset($p['srcURL']) ? $p['srcURL'] : ''));
 		if ($repoName === '' && $srcURL === '') {
 			continue;
 		}
@@ -499,13 +501,12 @@ function SetPluginRepoRecords($setting, $pending)
 }
 
 // Raises the certain flag and records which plugin raised it. The caller
-// holds PluginUnverifiedLock(), which also serialises this list. srcURL is
-// stored without credentials, as the install history stores it.
+// holds PluginUnverifiedLock(), which also serialises this list.
 function RecordPluginUnknown($repoName, $srcURL)
 {
 	WriteSettingToFile($GLOBALS['PLUGIN_UNKNOWN_SETTING'], '1');
 	$known = GetPluginRepoRecords($GLOBALS['PLUGIN_UNKNOWN_REPOS_SETTING']);
-	$known[] = array('repoName' => $repoName, 'srcURL' => PluginHistoryURL($srcURL));
+	$known[] = array('repoName' => $repoName, 'srcURL' => $srcURL);
 	SetPluginRepoRecords($GLOBALS['PLUGIN_UNKNOWN_REPOS_SETTING'], $known);
 }
 
@@ -2715,7 +2716,7 @@ function CheckForPluginUpdates()
 	}
 
 	// Held until return; released when $fetchLock goes out of scope.
-	$waitedFrom = time();
+	$waitedFrom = microtime(true);
 	$fetchLock = PluginFetchLock($plugin, true, $lockHeld);
 	if ($lockHeld) {
 		// Another fetch of this plugin (a sweep, an upgrade) has held the lock
@@ -2724,7 +2725,7 @@ function CheckForPluginUpdates()
 		// would make them. Otherwise say so rather than fetch against it.
 		$state = PluginUpdateStateRead();
 		$e = isset($state['plugins'][$plugin]) ? $state['plugins'][$plugin] : null;
-		if (!is_array($e) || !array_key_exists('updates', $e) || (int) $e['checkedAt'] < $waitedFrom) {
+		if (!is_array($e) || !array_key_exists('updates', $e) || PluginUpdateStateRecordedAt($e) < $waitedFrom) {
 			$result['Status'] = 'Error';
 			$result['reason'] = 'another check of this plugin is still running; try again in a moment';
 			$result['Message'] = 'Could not check ' . $plugin . ': ' . $result['reason'];
@@ -2932,7 +2933,7 @@ function PluginFetchReinstallTargetByURL($plugin, $branch, $url)
  * is `{"privacyAccepted": <block>}` with that block. Only the FPP Plugins
  * page may send `privacyAccepted`, and only with a block it actually showed
  * the operator (GET /plugin/{RepoName}/privacy; its Update and Update All
- * both do). Scripts and other API clients must not send it -- not even by
+ * both do). Scripts and other API clients POST no body -- not even by
  * echoing `pending` back from a refusal: on `Code: "PrivacyMismatch"` they
  * stop and send the operator to the Plugins page. The server cannot tell callers apart, so
  * this is a rule for clients, not something it enforces.
@@ -2943,7 +2944,6 @@ function PluginFetchReinstallTargetByURL($plugin, $branch, $url)
  * "pending": {"sends": [], "remoteAccess": "none"}}`.
  *
  * @route POST /api/plugin/{RepoName}/upgrade
- * @badge "FPP UI ONLY" warning
  * @body {"privacyAccepted": {"sends": [], "remoteAccess": "none"}}
  * @response 200 Plugin upgraded
  * ```json
@@ -2951,15 +2951,14 @@ function PluginFetchReinstallTargetByURL($plugin, $branch, $url)
  * ```
  */
 /**
- * Update plugin (no body)
+ * Update plugin by GET (deprecated)
  *
- * The same update as POST /api/plugin/{RepoName}/upgrade, sent without a
+ * The same update as POST /api/plugin/{RepoName}/upgrade sent without a
  * body: it is refused (`Code: "PrivacyMismatch"`) whenever the privacy
  * disclosure the update would land differs from the one accepted for this
- * plugin. This is the form for scripts and other API clients, which must
- * never send `privacyAccepted`.
+ * plugin. FPP 11 will require the POST.
  *
- * @route GET /api/plugin/{RepoName}/upgrade
+ * @route GET /api/plugin/{RepoName}/upgrade deprecated
  * @response 200 Plugin upgraded
  * ```json
  * {"Status": "OK", "Message": ""}
@@ -5117,7 +5116,8 @@ function PluginUpdateStateEmpty()
 	return array(
 		'version' => PLUGIN_UPDATE_STATE_VERSION,
 		'sweep' => array('startedAt' => 0, 'finishedAt' => 0, 'retryAt' => 0, 'retryAfter' => 0, 'result' => '', 'message' => '',
-			'lastResult' => '', 'lastMessage' => '', 'trigger' => '', 'done' => 0, 'total' => 0),
+			'lastResult' => '', 'lastMessage' => '', 'trigger' => '', 'done' => 0, 'total' => 0,
+			'forceRequested' => false),
 		'plugins' => array(),
 	);
 }
@@ -5188,20 +5188,31 @@ function PluginUpdateStateUpdate($fn)
 	return $ok;
 }
 
+// When a verdict was recorded, to compare with a microtime(true) instant.
+// Whole seconds for an entry an older FPP wrote.
+function PluginUpdateStateRecordedAt($e)
+{
+	if (isset($e['recordedAt']) && is_numeric($e['recordedAt'])) {
+		return (float) $e['recordedAt'];
+	}
+	return (float) (isset($e['checkedAt']) ? (int) $e['checkedAt'] : 0);
+}
+
 /**
  * Record one plugin's verdict (true/false/null, as PluginUpdateVerdict() returns);
  * $source ('sweep', 'check', 'upgrade', 'install') is kept for the support zip.
  *
- * $since: when the caller's fetch began. The sweep drops the fetch lock before
- * computing its verdict (the plugin's own script can take minutes), so an upgrade
- * or hand check can land in that gap; a verdict older than what is already
- * recorded is then discarded rather than written over the fresher one.
+ * $since: when the caller's fetch began (microtime(true)). The sweep drops the
+ * fetch lock before computing its verdict (the plugin's own script can take
+ * minutes), so an upgrade or hand check can land in that gap; a verdict older
+ * than what is already recorded is then discarded rather than written over the
+ * fresher one.
  */
 function PluginUpdateStateSet($plugin, $updates, $error = '', $source = 'check', $since = 0)
 {
 	PluginUpdateStateUpdate(function (&$state) use ($plugin, $updates, $error, $source, $since) {
-		if ($since > 0 && isset($state['plugins'][$plugin]['checkedAt'])
-			&& (int) $state['plugins'][$plugin]['checkedAt'] >= $since
+		if ($since > 0 && isset($state['plugins'][$plugin])
+			&& PluginUpdateStateRecordedAt($state['plugins'][$plugin]) >= $since
 			&& isset($state['plugins'][$plugin]['source'])
 			&& $state['plugins'][$plugin]['source'] !== $source) {
 			return false;
@@ -5209,6 +5220,9 @@ function PluginUpdateStateSet($plugin, $updates, $error = '', $source = 'check',
 		$entry = array(
 			'updates' => ($updates === null) ? null : (bool) $updates,
 			'checkedAt' => time(),
+			// Sub-second: an install's verdict and a sweep's fetch often fall in
+			// the same second, and must still be told apart.
+			'recordedAt' => microtime(true),
 			'error' => (string) $error,
 			'source' => $source,
 		);
@@ -5254,35 +5268,70 @@ function PluginUpdateStateForget($plugin)
 function PluginUpdateStateRecordSweep($result, $message = '', $trigger = 'background', $starting = false, $retryAfter = PLUGIN_UPDATE_SWEEP_INTERVAL)
 {
 	return PluginUpdateStateUpdate(function (&$state) use ($result, $message, $trigger, $starting, $retryAfter) {
-		// Rebuilt from the known keys, not merged: a key an earlier layout
-		// wrote must not ride along in the file for ever.
-		$prev = is_array($state['sweep']) ? $state['sweep'] : array();
-		$state['sweep'] = array(
-			'startedAt' => $starting ? time() : (int) (isset($prev['startedAt']) ? $prev['startedAt'] : 0),
-			'finishedAt' => $starting ? (int) (isset($prev['finishedAt']) ? $prev['finishedAt'] : 0) : time(),
-			'retryAt' => $starting ? (int) (isset($prev['retryAt']) ? $prev['retryAt'] : 0) : time() + (int) $retryAfter,
-			// Kept so the next offline pass can back off from it.
-			'retryAfter' => $starting ? (int) (isset($prev['retryAfter']) ? $prev['retryAfter'] : 0) : (int) $retryAfter,
-			'result' => $result,
-			'message' => (string) $message,
-			// The last FINISHED result, kept through the in-progress record so
-			// the script can back off from it and keep it when a pass checks
-			// nothing. (The endpoint writes in-progress before the script runs.)
-			'lastResult' => $starting
-				? ((isset($prev['result']) && $prev['result'] !== 'in-progress' && $prev['result'] !== '')
-					? (string) $prev['result'] : (string) (isset($prev['lastResult']) ? $prev['lastResult'] : ''))
-				: (string) $result,
-			'lastMessage' => $starting
-				? ((isset($prev['result']) && $prev['result'] !== 'in-progress' && $prev['result'] !== '')
-					? (string) (isset($prev['message']) ? $prev['message'] : '') : (string) (isset($prev['lastMessage']) ? $prev['lastMessage'] : ''))
-				: (string) $message,
-			'trigger' => $trigger,
-			// How far a running sweep has got, for the Updates tab's progress line.
-			'done' => 0,
-			'total' => $starting ? (int) (isset($prev['total']) ? $prev['total'] : 0) : 0,
-		);
+		$state['sweep'] = PluginUpdateSweepRecord($state['sweep'], $result, $message, $trigger, $starting, $retryAfter);
 		return true;
 	});
+}
+
+// The sweep record PluginUpdateStateRecordSweep() writes, built from the one before.
+function PluginUpdateSweepRecord($prev, $result, $message, $trigger, $starting, $retryAfter)
+{
+	// Rebuilt from the known keys, not merged: a key an earlier layout
+	// wrote must not ride along in the file for ever.
+	$prev = is_array($prev) ? $prev : array();
+	return array(
+		'startedAt' => $starting ? time() : (int) (isset($prev['startedAt']) ? $prev['startedAt'] : 0),
+		'finishedAt' => $starting ? (int) (isset($prev['finishedAt']) ? $prev['finishedAt'] : 0) : time(),
+		'retryAt' => $starting ? (int) (isset($prev['retryAt']) ? $prev['retryAt'] : 0) : time() + (int) $retryAfter,
+		// Kept so the next offline pass can back off from it.
+		'retryAfter' => $starting ? (int) (isset($prev['retryAfter']) ? $prev['retryAfter'] : 0) : (int) $retryAfter,
+		'result' => $result,
+		'message' => (string) $message,
+		// The last FINISHED result, kept through the in-progress record so
+		// the script can back off from it and keep it when a pass checks
+		// nothing. (The endpoint writes in-progress before the script runs.)
+		'lastResult' => $starting
+			? ((isset($prev['result']) && $prev['result'] !== 'in-progress' && $prev['result'] !== '')
+				? (string) $prev['result'] : (string) (isset($prev['lastResult']) ? $prev['lastResult'] : ''))
+			: (string) $result,
+		'lastMessage' => $starting
+			? ((isset($prev['result']) && $prev['result'] !== 'in-progress' && $prev['result'] !== '')
+				? (string) (isset($prev['message']) ? $prev['message'] : '') : (string) (isset($prev['lastMessage']) ? $prev['lastMessage'] : ''))
+			: (string) $message,
+		'trigger' => $trigger,
+		// How far a running sweep has got, for the Updates tab's progress line.
+		'done' => 0,
+		'total' => $starting ? (int) (isset($prev['total']) ? $prev['total'] : 0) : 0,
+		// A Check for Updates that arrived while this sweep ran (see
+		// RefreshPluginUpdateStatus()). Kept through the script's own start
+		// record, which can land after the request did.
+		'forceRequested' => $starting && !empty($prev['forceRequested']),
+	);
+}
+
+/**
+ * The end of a sweep pass. When Check for Updates asked for a check while the
+ * pass ran, the pass may have fetched a plugin before what the user is looking
+ * for was pushed, or (a background pass) skipped it as recently checked: then
+ * nothing is recorded as finished, the sweep starts over as a forced pass, and
+ * this returns false. Otherwise it records the result and returns true. One
+ * locked update for both, so a request can't land between the look and the
+ * finishing record and be dropped with no pass to answer it.
+ */
+function PluginUpdateStateFinishSweep($result, $message, $trigger, $retryAfter)
+{
+	$finished = true;
+	PluginUpdateStateUpdate(function (&$state) use ($result, $message, $trigger, $retryAfter, &$finished) {
+		if (!empty($state['sweep']['forceRequested'])) {
+			$finished = false;
+			$state['sweep'] = PluginUpdateSweepRecord($state['sweep'], 'in-progress', '', 'manual', true, 0);
+			$state['sweep']['forceRequested'] = false;
+		} else {
+			$state['sweep'] = PluginUpdateSweepRecord($state['sweep'], $result, $message, $trigger, false, $retryAfter);
+		}
+		return true;
+	});
+	return $finished;
 }
 
 // The running sweep's progress: $done of $total plugins so far.
@@ -5485,7 +5534,7 @@ function GetPluginUpdateStatus()
 /**
  * Check every plugin for updates now
  *
- * Starts the background check of every installed plugin (the same one that runs off page loads, but every plugin regardless of age) and returns at once. Poll `GET /api/plugin/updateStatus` until `sweep.result` is no longer `in-progress`. `started` is false when one was already running.
+ * Starts the background check of every installed plugin (the same one that runs off page loads, but every plugin regardless of age) and returns at once. Poll `GET /api/plugin/updateStatus` until `sweep.result` is no longer `in-progress`. `started` is false when one was already running; that one then checks every plugin again before it finishes, so the answer polled for still comes from a check made after this request.
  *
  * @route POST /api/plugin/updateStatus/refresh
  * @response 200 Started, or already running
@@ -5498,9 +5547,23 @@ function RefreshPluginUpdateStatus()
 	if (empty(InstalledPluginNames())) {
 		return json(array('status' => 'OK', 'started' => false, 'message' => 'no plugins installed'));
 	}
-	$state = PluginUpdateStateRead();
-	if (PluginUpdateSweepRunning($state['sweep'])) {
-		return json(array('status' => 'OK', 'started' => false, 'message' => 'a check is already running'));
+	// A sweep already running may be a background one, which skips plugins
+	// checked lately, or may have fetched a plugin before what the user is
+	// after was pushed; the page then waited for it and offered nothing to
+	// update. Ask it for a forced pass of its own once it is done (it stays
+	// in progress meanwhile, so the page waits for that one). Looked at and
+	// asked under the state lock, so the sweep can't finish in between.
+	$running = false;
+	PluginUpdateStateUpdate(function (&$state) use (&$running) {
+		if (!PluginUpdateSweepRunning($state['sweep'])) {
+			return false;
+		}
+		$running = true;
+		$state['sweep']['forceRequested'] = true;
+		return true;
+	});
+	if ($running) {
+		return json(array('status' => 'OK', 'started' => false, 'message' => 'a check is already running; every plugin is checked again when it finishes'));
 	}
 	if (!PluginUpdateStartSweep('manual')) {
 		return json(array('status' => 'ERROR', 'started' => false, 'message' => 'could not start the check; see the FPP log'));

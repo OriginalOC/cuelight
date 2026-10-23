@@ -15,6 +15,7 @@
 #include "fpp-json.h"
 
 // not in fpp-pch.h; libc++ pulls them in transitively but libstdc++ does not
+#include <cmath>
 #include <memory>
 #include <tuple>
 
@@ -22,6 +23,7 @@
 #include "../log.h"
 
 #include "PixelString.h"
+#include "ChannelOutputSetup.h"
 #include "../OutputMonitor.h"
 #include "../Warnings.h"
 #include "overlays/PixelOverlay.h"
@@ -36,11 +38,11 @@ constexpr uint32_t SMART_RECEIVER_LEADOUT = 6 * 3;
 
 constexpr uint32_t SMART_RECEIVER_V2_GAP = 10;
 
-#define CHECKPS_SETTING(SETTING)                                                           \
-    if (SETTING) {                                                                         \
-        LogErr(VB_CHANNELOUT, "Invalid PixelString Config %s\n", #SETTING);                \
-        WarningHolder::AddWarning(26, "Invalid PixelString Config: " + std::string(#SETTING)); \
-        return 0;                                                                          \
+#define CHECKPS_SETTING(SETTING)                                                            \
+    if (SETTING) {                                                                          \
+        LogErr(VB_CHANNELOUT, "Invalid PixelString Config %s\n", #SETTING);                 \
+        AddOutputConfigWarning(26, "Invalid PixelString Config: " + std::string(#SETTING)); \
+        return 0;                                                                           \
     }
 
 // one config key per receiver; the hasChannels array in Init() is sized to
@@ -261,6 +263,12 @@ PixelString::~PixelString() {
  */
 int PixelString::Init(Json::Value config, Json::Value* pinConfig) {
     m_portNumber = config["portNumber"].asInt();
+    // Drivers index per-port arrays (smart receiver packets, GPIO commands,
+    // current monitoring) by this, unchecked.
+    if (m_portNumber < 0) {
+        LogErr(VB_CHANNELOUT, "Pixel string has an invalid port number %d\n", m_portNumber);
+        return 0;
+    }
     m_outputBytes = 0;
     // needed before the virtual strings are read so their lookup tables are
     // built at the right width
@@ -293,9 +301,9 @@ int PixelString::Init(Json::Value config, Json::Value* pinConfig) {
                 // edited differentialType is the only way to get here
                 LogWarn(VB_CHANNELOUT, "Invalid smart receiver count %d on port %d; using %d\n",
                         receiverCount, m_portNumber + 1, MAX_SMART_RECEIVERS);
-                WarningHolder::AddWarning("PixelString: invalid smart receiver count on port " +
-                                          std::to_string(m_portNumber + 1) + ", using " +
-                                          std::to_string(MAX_SMART_RECEIVERS));
+                AddOutputConfigWarning(UNKNOWN_WARNING_ID, "PixelString: invalid smart receiver count on port " +
+                                                               std::to_string(m_portNumber + 1) + ", using " +
+                                                               std::to_string(MAX_SMART_RECEIVERS));
                 receiverCount = MAX_SMART_RECEIVERS;
             }
         }
@@ -306,7 +314,7 @@ int PixelString::Init(Json::Value config, Json::Value* pinConfig) {
             // pixel data, so a wide part would need two widths in one stream.
             // Falcon v4/v5 markers are zero length, so those are fine.
             LogWarn(VB_CHANNELOUT, "16 bit protocols are not supported with v1/v2 smart receivers on port %d; using 8 bit\n", m_portNumber + 1);
-            WarningHolder::AddWarning("PixelString: 16 bit protocol not supported with v1/v2 smart receivers on port " + std::to_string(m_portNumber + 1));
+            AddOutputConfigWarning(UNKNOWN_WARNING_ID, "PixelString: 16 bit protocol not supported with v1/v2 smart receivers on port " + std::to_string(m_portNumber + 1));
             m_bytesPerChannel = 1;
         }
     } else {
@@ -591,9 +599,15 @@ int PixelString::ReadVirtualString(Json::Value& vsc, VirtualString& vs) const {
     if (vs.brightness > 100 || vs.brightness < 0) {
         vs.brightness = 100;
     }
-    if (!(vs.gamma >= 0.01)) {
-        // also catches NaN, which compares false either way
-        vs.gamma = 0.01;
+    if (!std::isfinite(vs.gamma)) {
+        // "nan" or "inf" in a hand-edited config: not a gamma anyone chose,
+        // so use the default rather than clamping it to an end of the range
+        // (NaN fails both clamps below and landed on 0.01, a curve that
+        // drives every lit channel near full brightness)
+        vs.gamma = 1.0f;
+    }
+    if (vs.gamma < 0.01f) {
+        vs.gamma = 0.01f;
     }
     if (vs.gamma > 50.0f) {
         vs.gamma = 50.0f;

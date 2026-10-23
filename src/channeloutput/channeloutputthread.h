@@ -46,8 +46,15 @@ void DestroyChannelOutputSyncVars(void);
 // Send a frame now rather than at the next due time.  False when the output
 // thread isn't running (or is stopping) and so won't: send it yourself.
 bool ForceChannelOutputNow(void);
+// The same, and that frame is sent even while output is disabled (the outputs
+// API's "disable"): the output thread then still prepares every frame, so a
+// blank has to go out from it rather than from a second thread alongside it.
+bool ForceChannelOutputSendNow(void);
 
 int ChannelOutputThreadIsRunning(void);
+// Whether the caller is the channel output thread (which holds
+// outputThreadLock for the whole of each cycle).
+bool IsChannelOutputThread(void);
 int ChannelOutputThreadIsEnabled();
 void SetChannelOutputRefreshRate(float rate);
 float GetChannelOutputRefreshRate();
@@ -57,6 +64,9 @@ void StartForcingChannelOutput(void);
 void StopForcingChannelOutput(void);
 void ResetMasterPosition(void);
 void UpdateMasterPosition(int frameNumber);
+// framePosition is where the master is in frames, fractions included (a
+// remoteOffset that is not a whole number of frames); frameNumber is it rounded.
+void UpdateMasterPosition(int frameNumber, double framePosition);
 void CalculateNewChannelOutputDelay(float mediaPosition);
 // The media clock the sequence follows runs at `rate` times the system clock's
 // pace; call it with each position update.  Frames go out at that pace.

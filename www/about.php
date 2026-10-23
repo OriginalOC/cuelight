@@ -67,7 +67,9 @@
             // back to the naive presence check.
             var vm = currentFPPVersion.match(/(\d+)\.(?:(\d+)|x)(?:\.(\d+))?/i);
             if (!vm) return null;
-            var dm = currentOSRelease ? currentOSRelease.match(/(\d{4})-?(\d{2})/) : null;
+            // "v2026-10 (64bit)", or "v2026-10b (64bit)" for a second image the
+            // same month (see osRebuildLevel()).
+            var dm = currentOSRelease ? currentOSRelease.match(/(\d{4})-?(\d{2})([a-z])?/i) : null;
             return {
                 major: parseInt(vm[1]),
                 // An "x" minor means a dev build that is ahead of every stable release
@@ -75,7 +77,8 @@
                 // compares normally, so a newer major release is still flagged.
                 minor: vm[2] !== undefined ? parseInt(vm[2]) : Number.MAX_SAFE_INTEGER,
                 patch: vm[3] !== undefined ? parseInt(vm[3]) : 0,
-                dateNum: dm ? parseInt(dm[1] + dm[2]) : 0
+                dateNum: dm ? parseInt(dm[1] + dm[2]) : 0,
+                rebuild: dm ? osRebuildLevel(dm[3]) : 0
             };
         }
 
@@ -117,8 +120,11 @@
                     newer = candPatch > baseline.patch;
                 } else {
                     // Same version -- a prerelease of the installed version is not
-                    // an upgrade; otherwise a newer build date is.
-                    newer = !info.prereleaseType && info.dateNum > baseline.dateNum;
+                    // an upgrade; otherwise a newer build date is, or a later
+                    // rebuild of the same month (2026-10b over 2026-10).
+                    newer = !info.prereleaseType &&
+                        (info.dateNum > baseline.dateNum ||
+                            (info.dateNum === baseline.dateNum && info.rebuild > baseline.rebuild));
                 }
                 if (newer) {
                     hasNewerOS = true;
@@ -167,6 +173,17 @@
         }
 
         /**
+         * A second OS image built in the same month carries a letter after the
+         * month (2026-10b, then 2026-10c; build-images.yml picks it), so the
+         * players already on that month's image are offered it. No letter, or
+         * "a", is the month's first image: 0; "b" is 1, and so on.
+         */
+        function osRebuildLevel(letter) {
+            if (!letter) return 0;
+            return Math.max(0, letter.toLowerCase().charCodeAt(0) - 97);
+        }
+
+        /**
          * Parse an FPPOS filename into sortable components.
          * Handles patterns like:
          *   Pi64-10.0-beta2_2025-07.fppos
@@ -185,7 +202,7 @@
                 patch: null,
                 prereleaseType: null,
                 prereleaseNum: null,
-                rebuild: false,
+                rebuild: 0,
                 dateNum: 0,
                 raw: name
             };
@@ -228,7 +245,8 @@
                 result.dateNum = parseInt(dateMatch[1] + (dateMatch[3] || dateMatch[2]));
             }
 
-            result.rebuild = /b\.fppos$/i.test(name);
+            var revMatch = name.match(/_\d{4}-?\d{2}(?:\d{2})?([a-z])\.fppos$/i);
+            result.rebuild = osRebuildLevel(revMatch ? revMatch[1] : '');
 
             return result;
         }
@@ -264,8 +282,7 @@
                 return (infoB.prereleaseNum || 0) - (infoA.prereleaseNum || 0);
             }
 
-            if (infoA.rebuild && !infoB.rebuild) return -1;
-            if (!infoA.rebuild && infoB.rebuild) return 1;
+            if (infoA.rebuild !== infoB.rebuild) return infoB.rebuild - infoA.rebuild;
 
             var platformOrder = { 'Pi64': 0, 'Pi': 1, 'BB64': 2, 'BBB': 3 };
             var platA = platformOrder[infoA.platform] !== undefined ? platformOrder[infoA.platform] : 99;
@@ -429,7 +446,7 @@
         function updateCardSubtitles() {
             var $fpp = $('#fppCardSubtitle');
             if (needsRebuild) {
-                $fpp.text('FPP has not been built on this system. Rebuild to restore the FPP daemon.');
+                $fpp.text('FPP is not built, or its program files are damaged. Rebuild to restore the FPP daemon.');
             } else if (isMajorVersionUpgrade) {
                 $fpp.text('Cannot upgrade across major versions from here. Use the OS upgrade instead.' +
                     (sameBranchUpdateAvailable ? ' Updates for your current version can still be installed.' : ''));
@@ -1076,7 +1093,7 @@
                 FPPUpdate_AddHideButton('fppUpgrade');
             }
             SetProgressDialogStatus('fppUpgrade', fppUpgradeTitle + ' — Starting…');
-            StreamURL('manualUpdate.php?wrapped=1', 'fppUpgradeText', 'FPPUpgradeDone', 'FPPUpgradeDone', 'GET', null, null, true, false, 'FPPUpgradeProgress'); // trailing arg: generic stage-status hook
+            StreamURL('manualUpdate.php?wrapped=1', 'fppUpgradeText', 'FPPUpgradeDone', 'FPPUpgradeDone', 'POST', null, null, true, false, 'FPPUpgradeProgress'); // trailing arg: generic stage-status hook
         }
 
         function FPPUpgradeDone() {
@@ -1258,7 +1275,7 @@
                     FPPUpdate_AddHideButton('osUpgrade');
                 }
                 SetProgressDialogStatus('osUpgrade', 'FPP OS Upgrade — Starting…');
-                StreamURL('upgradeOS.php?wrapped=1&os=' + os + keepOptFPP, 'osUpgradeText', 'OSUpgradeDone', 'OSUpgradeDone', 'GET', null, null, true, false, 'OSUpgradeProgress'); // trailing arg: generic stage-status hook
+                StreamURL('upgradeOS.php?wrapped=1&os=' + os + keepOptFPP, 'osUpgradeText', 'OSUpgradeDone', 'OSUpgradeDone', 'POST', null, null, true, false, 'OSUpgradeProgress'); // trailing arg: generic stage-status hook
             }
         }
 
@@ -1295,7 +1312,7 @@
 
             var url = osAssetMap[os].url;
             DisplayProgressDialog('osDownload', 'FPP Download OS Image');
-            StreamURL('upgradeOS.php?wrapped=1&downloadOnly=1&os=' + url, 'osDownloadText', 'OSDownloadDone');
+            StreamURL('upgradeOS.php?wrapped=1&downloadOnly=1&os=' + url, 'osDownloadText', 'OSDownloadDone', '', 'POST');
         }
 
         function OSDownloadDone() {
@@ -1709,7 +1726,7 @@
                                 <span class="fpp-version-indicator__current">Not built</span>
                                 <span class="fpp-upd-dot fpp-upd-dot--required">Rebuild required</span>
                                 <span class="fpp-version-indicator__label fpp-version-indicator__label--subtle">FPP
-                                    has not been built on this system</span>
+                                    is not built, or its program files are damaged</span>
                             </div>
 
                             <!-- Standard View Version Indicators (uiLevel 0 - Basic) -->

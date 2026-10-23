@@ -77,6 +77,9 @@ function FilesValidatePathOrFail($baseDir, $requested, $allowMissingParent = fal
     if ($requested === '' || strpos($requested, "\\") !== false || strpos($requested, "\0") !== false) { http_response_code(400); echo json_encode(["status"=>"Invalid path"]); exit; }
     $decoded = rawurldecode($requested);
     if (strpos($requested, '..') !== false || strpos($decoded, '..') !== false || (isset($decoded[0]) && $decoded[0] === '/') || preg_match('/%2e/i', $requested)) { http_response_code(403); echo json_encode(["status"=>"Invalid path"]); exit; }
+    // realpath("") is the working directory -- php-fpm's is this script's --
+    // so an unmapped directory key would make that the base
+    if (!is_string($baseDir) || $baseDir === '') { http_response_code(400); echo json_encode(["status"=>"Invalid Directory"]); exit; }
     $baseReal = realpath($baseDir);
     if ($baseReal === false) { http_response_code(500); exit; }
     $candidate = $baseReal . '/' . $requested;
@@ -87,12 +90,15 @@ function FilesValidatePathOrFail($baseDir, $requested, $allowMissingParent = fal
         $parts = explode('/', $requested);
         array_pop($parts);
         $cur = $baseReal;
-        foreach ($parts as $p) { if ($p === '' || $p === '.') continue; if (strpos($p, '..') !== false) { http_response_code(403); exit; } $cur .= '/' . $p; $rp = realpath($cur); if ($rp !== false && strpos($rp, $baseReal) !== 0) { http_response_code(403); exit; } }
+        foreach ($parts as $p) { if ($p === '' || $p === '.') continue; if (strpos($p, '..') !== false) { http_response_code(403); exit; } $cur .= '/' . $p; $rp = realpath($cur); if ($rp !== false && !PathIsWithin($rp, $baseReal)) { http_response_code(403); exit; } }
         $realParent = $baseReal;
     }
-    if (strpos($realParent, $baseReal) !== 0) { http_response_code(403); echo json_encode(["status"=>"Invalid path: directory traversal"]); exit; }
+    if (!PathIsWithin($realParent, $baseReal)) { http_response_code(403); echo json_encode(["status"=>"Invalid path: directory traversal"]); exit; }
     $realLeaf = realpath($candidate);
-    if ($realLeaf !== false && strpos($realLeaf, $baseReal) !== 0) { http_response_code(403); exit; }
+    if ($realLeaf !== false && !PathIsWithin($realLeaf, $baseReal)) { http_response_code(403); exit; }
+    // .htpasswd and the saved interfaces (WiFi keys) belong to their own
+    // routes, which never return the secret; see ConfigPathIsCredential().
+    if (ConfigPathIsCredential($candidate)) { http_response_code(403); echo json_encode(["status"=>"Invalid path"]); exit; }
     return $candidate;
 }
 
@@ -379,10 +385,16 @@ function GetFiles()
         return json(array("status" => "Invalid Directory"));
     }
 
+    // Credential files in the config directory are not served
+    // (ConfigPathIsCredential()), so not listed.
+    $files = array_values(array_filter(GetFilesHelper($dirName), function ($f) use ($dirName) {
+        $name = is_array($f) ? $f['name'] : $f;
+        return !ConfigPathIsCredential($dirName . '/' . $name);
+    }));
     if (isset($_GET['nameOnly']) && ($_GET['nameOnly'] == '1')) {
-        return json(GetFilesHelper($dirName));
+        return json($files);
     } else {
-        return json(array("status" => "ok", "files" => GetFilesHelper($dirName)));
+        return json(array("status" => "ok", "files" => $files));
     }
 }
 
@@ -712,11 +724,23 @@ function GetFileImpl($dir, $filename, $lines, $play, $attach)
     $fullPath = FilesValidatePathOrFail($dir, $filename);
     if (!file_exists($fullPath) || !is_file($fullPath)) {
         http_response_code(404);
+        header('Content-type: text/plain');
         echo "File $fullPath does not exist.";
         return;
     }
 
+    // These are the user's files, served from this player's origin: an
+    // upload, a MultiSync push or a sequence package can put anything in
+    // them.  Never let one run as a page here.  The type comes from the
+    // extension, never from sniffing the content (an "x.png" holding HTML
+    // came back as text/html), anything else is plain bytes, and the
+    // sandbox stops script even in an SVG opened directly.  An <img>,
+    // <audio> or <video> loading the file is unaffected.
+    header('X-Content-Type-Options: nosniff');
+    header('Content-Security-Policy: sandbox');
+
     if ($play) {
+        header('Content-type: application/octet-stream');
         if (preg_match('/mp3$/i', $filename)) {
             header('Content-type: audio/mp3');
         } else if (preg_match('/ogg$/i', $filename)) {
@@ -744,7 +768,12 @@ function GetFileImpl($dir, $filename, $lines, $play, $attach)
         }
 
     } else if ($isImage) {
-        header('Content-type: ' . mime_content_type($fullPath));
+        static $imageTypes = array(
+            'png' => 'image/png', 'jpg' => 'image/jpeg', 'jpeg' => 'image/jpeg',
+            'gif' => 'image/gif', 'webp' => 'image/webp', 'bmp' => 'image/bmp',
+            'ico' => 'image/x-icon', 'svg' => 'image/svg+xml', 'avif' => 'image/avif');
+        $ext = strtolower(pathinfo($filename, PATHINFO_EXTENSION));
+        header('Content-type: ' . ($imageTypes[$ext] ?? 'application/octet-stream'));
 
         if ($attach == 1) {
             header('Content-disposition: attachment;filename="' . SanitizeDownloadFilename($filename) . '"');
@@ -879,7 +908,8 @@ function findFile($dir, $filename, $allowSubdir = false)
  * subfolder based on its extension, returning a status of `OK` or an error
  * message if not successful.
  *
- * @route GET /api/file/move/{fileName}
+ * @route POST /api/file/move/{fileName}
+ * @route GET /api/file/move/{fileName} deprecated
  * @response 200 File moved to media directory
  * ```json
  * {"status": "OK"}
@@ -1286,6 +1316,8 @@ function removeDir(string $dir): void
  *   "dir": "uploads"
  * }
  * ```
+ * @response 403 The path resolves outside the directory
+ * @response 404 No such file
  */
 function DeleteFile()
 {
@@ -1296,6 +1328,14 @@ function DeleteFile()
     $dir = MapDirectoryKey($dirName);
     $fileName = params(0);
 
+    if ($dir == "") {
+        // An unknown key, or "plugins", maps to "".  realpath("") below is the
+        // working directory (www/api under php-fpm), which then passed the
+        // containment check as the base: DELETE /api/file/plugins/opt/fpp/www/api/...
+        // removed FPP's own files.
+        http_response_code(400);
+        return json(array("status" => "Invalid Directory", "file" => $fileName, "dir" => $dirName));
+    }
     if ($fileName == "" && $dir == $uploadDirectory) {
         // Hitting cancel on an upload will call delete with no filename
         return json(array("status" => "Invalid parameters", "file" => $fileName, "dir" => $dirName));
@@ -1312,8 +1352,23 @@ function DeleteFile()
     //here rather than as a prompt on the page so it holds for every caller.
     $blobRefusal = ($fullPath !== false) ? DescribeBackupBlobDeletion($fullPath) : '';
 
-    if (!$allowedDir || !$fullPath || strpos($fullPath, $allowedDir) !== 0) {
+    if (!$allowedDir || !$fullPath) {
+        // realpath() fails for a name that is not there.
+        http_response_code(404);
+        $status = "File Not Found";
+    } else if (!PathIsWithin($fullPath, $allowedDir)) {
+        // Refused, and said so in the status like the GET and POST routes do;
+        // it used to come back as a 200.
+        http_response_code(403);
         $status = "Invalid path: directory traversal detected or file outside allowed directory";
+    } else if ($fullPath === $allowedDir) {
+        // An empty name (DELETE /api/file/sequences/) or "." resolved to the
+        // directory itself, which removeDir() below emptied and removed.
+        $status = "Invalid path: refusing to delete the whole directory";
+    } else if (ConfigPathIsCredential($constructedPath)) {
+        // .htpasswd or a saved interface; see ConfigPathIsCredential().
+        http_response_code(403);
+        $status = "Invalid path";
     } else if (!file_exists($fullPath)) {
         $status = "File Not Found";
     } else if ($blobRefusal !== '') {
@@ -1890,7 +1945,7 @@ function TailFollowFile()
     $realDir = realpath($dir);
     $realPath = realpath($fullPath);
 
-    if (!$realDir || !$realPath || strpos($realPath, $realDir) !== 0) {
+    if (!$realDir || !$realPath || !PathIsWithin($realPath, $realDir)) {
         http_response_code(403);
         echo "Invalid file path.";
         return;

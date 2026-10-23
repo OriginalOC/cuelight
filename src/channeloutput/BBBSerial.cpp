@@ -28,6 +28,7 @@
 
 // FPP includes
 #include "BBBSerial.h"
+#include "ChannelOutputSetup.h"
 
 #include "../non-gpl/CapeUtils/CapeUtils.h"
 #include "util/BBBUtils.h"
@@ -124,7 +125,13 @@ int BBBSerialOutput::Init(Json::Value config) {
     for (int i = 0; i < config["outputs"].size(); i++) {
         Json::Value s = config["outputs"][i];
 
-        m_startChannels[s["outputNumber"].asInt()] = s["startChannel"].asInt() - 1;
+        // straight from the config: out of range it wrote past m_startChannels
+        int outputNumber = s["outputNumber"].asInt();
+        if (outputNumber < 0 || outputNumber >= m_outputs) {
+            LogErr(VB_CHANNELOUT, "BBBSerial: ignoring output %d, the cape has %d\n", outputNumber + 1, m_outputs);
+            continue;
+        }
+        m_startChannels[outputNumber] = s["startChannel"].asInt() - 1;
         int l = s["channelCount"].asInt();
         if (l > maxLen) {
             maxLen = l;
@@ -162,7 +169,7 @@ int BBBSerialOutput::Init(Json::Value config) {
         }
         if (!CapeUtils::INSTANCE.getStringConfig(device + verPostf, root)) {
             LogErr(VB_CHANNELOUT, "Could not read pin configuration for %s%s\n", device.c_str(), verPostf.c_str());
-            WarningHolder::AddWarning(13, "BBBSerial: Could not read pin configuration for " + device + verPostf);
+            AddOutputConfigWarning(13, "BBBSerial: Could not read pin configuration for " + device + verPostf);
             return 0;
         }
     }
@@ -211,7 +218,7 @@ int BBBSerialOutput::Init(Json::Value config) {
     compileSerialPRUCode(args);
     if (!FileExists(pru_program.c_str())) {
         LogErr(VB_CHANNELOUT, "%s does not exist!\n", pru_program.c_str());
-        WarningHolder::AddWarning(26, "BBBSerial: Could not compile PRU program");
+        AddOutputConfigWarning(26, "BBBSerial: Could not compile PRU program");
         return 0;
     }
     LogDebug(VB_CHANNELOUT, "Using program %s\n", pru_program.c_str());
@@ -221,12 +228,12 @@ int BBBSerialOutput::Init(Json::Value config) {
     m_ddrArea = BBBPru::ddrAlloc("BBBSerial", DDR_RESERVED, m_ddrPhys);
     if (!m_ddrArea) {
         LogErr(VB_CHANNELOUT, "BBBSerial: no room in the PRU DDR region\n");
-        WarningHolder::AddWarning(20, "BBBSerial: no room in the PRU DDR region");
+        AddOutputConfigWarning(20, "BBBSerial: no room in the PRU DDR region");
         return 0;
     }
     if (!m_pru->run(pru_program)) {
         LogErr(VB_CHANNELOUT, "BBBSerial: Unable to start PRU. May require a reboot.\n");
-        WarningHolder::AddWarning(20, "BBBSerial: Unable to start PRU. May require a reboot.");
+        AddOutputConfigWarning(20, "BBBSerial: Unable to start PRU. May require a reboot.");
         return 0;
     }
     // after run(): it clears the PRU data ram, so anything written to the

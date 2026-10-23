@@ -414,14 +414,22 @@ std::shared_ptr<Command> CommandManager::acquireCommand(const std::string& name)
         std::lock_guard<std::mutex> il(inFlightLock);
         inFlight[cmd]++;
     }
-    // Releases the pin, never deletes: the command's owner does that.
+    // Releases the pin. Deletes only a command retireCommand() handed over
+    // while it ran; otherwise the command's owner does that.
     return std::shared_ptr<Command>(cmd, [this](Command* c) {
-        std::lock_guard<std::mutex> il(inFlightLock);
-        auto it = inFlight.find(c);
-        if (it != inFlight.end() && --it->second <= 0) {
-            inFlight.erase(it);
+        Command* toDelete = nullptr;
+        {
+            std::lock_guard<std::mutex> il(inFlightLock);
+            auto it = inFlight.find(c);
+            if (it != inFlight.end() && --it->second <= 0) {
+                inFlight.erase(it);
+                if (retired.erase(c)) {
+                    toDelete = c;
+                }
+            }
+            inFlightCV.notify_all();
         }
-        inFlightCV.notify_all();
+        delete toDelete;
     });
 }
 
@@ -445,16 +453,40 @@ void CommandManager::removeCommand(Command* cmd) {
     {
         std::unique_lock<std::shared_mutex> l(commandsLock);
         auto a = commands.find(cmd->name);
-        if (a == commands.end() || a->second != cmd) {
-            // Another object holds this name now (two outputs registering the
-            // same command); removing by name would unregister theirs.
+        if (a != commands.end() && a->second == cmd) {
+            commands.erase(a);
+            commandMeta.erase(cmd->name);
+            ++commandsGeneration;
+        }
+        // else another object holds this name now (two outputs registering
+        // the same command, or a reload's replacement registering first);
+        // removing by name would unregister theirs.
+    }
+    // Waited for either way: a replaced command can still be running from
+    // before its replacement, and the caller deletes it next.
+    waitForIdle(cmd);
+}
+void CommandManager::retireCommand(Command* cmd) {
+    {
+        std::unique_lock<std::shared_mutex> l(commandsLock);
+        auto a = commands.find(cmd->name);
+        if (a != commands.end() && a->second == cmd) {
+            commands.erase(a);
+            commandMeta.erase(cmd->name);
+            ++commandsGeneration;
+        }
+    }
+    // Unregistered first, so no new run can pin it: any run still counted
+    // here started before, and the last one to return deletes it. Nothing
+    // waits, so a run that outlasts any bound is not freed under itself.
+    {
+        std::lock_guard<std::mutex> il(inFlightLock);
+        if (inFlight.find(cmd) != inFlight.end()) {
+            retired.insert(cmd);
             return;
         }
-        commands.erase(a);
-        commandMeta.erase(cmd->name);
-        ++commandsGeneration;
     }
-    waitForIdle(cmd);
+    delete cmd;
 }
 void CommandManager::removeCommand(const std::string& cmdName) {
     Command* cmd = nullptr;
@@ -819,11 +851,36 @@ std::unique_ptr<Command::Result> CommandManager::run(const Json::Value& cmd) {
  * Note that empty path segments collapse, so an argument that should be empty
  * cannot be passed this way - use the POST form below for that.
  *
- * @route GET /api/command/{command}
+ * Deprecated: FPP 11 will require one of the POST forms below.
+ *
+ * @route GET /api/command/{command} deprecated
  * @response 200 Command result (text/plain).
  * @response 404 No command with that name exists.
  * @response 500 The command errored or timed out.
  */
+// GET /api/command/<name>/... runs a command, so over plain HTTP any web page
+// can make a browser run one. FPP 11 will require POST (docs/DEPRECATED.md);
+// until then it works, carries a Deprecation header, and is logged at most
+// once an hour per command and client so its callers can be found.
+static void NoteDeprecatedCommandGet(const std::string& command, const std::string& client) {
+    static std::mutex lock;
+    static std::map<std::string, uint64_t> lastLogged;
+    uint64_t now = GetTimeMS();
+    std::string key = command + "|" + client;
+    std::unique_lock<std::mutex> l(lock);
+    auto it = lastLogged.find(key);
+    if (it != lastLogged.end() && now - it->second < 3600 * 1000ULL) {
+        return;
+    }
+    if (lastLogged.size() > 256) {
+        lastLogged.clear();
+    }
+    lastLogged[key] = now;
+    l.unlock();
+    LogWarn(VB_COMMAND, "Deprecated: GET /api/command/%s from %s; FPP 11 will require POST /api/command (docs/DEPRECATED.md)\n",
+            command.c_str(), client.c_str());
+}
+
 HttpResponsePtr CommandManager::render_GET(const HttpRequestPtr& req) {
     auto parts = getPathPieces(req->path());
     int plen = parts.size();
@@ -916,6 +973,12 @@ HttpResponsePtr CommandManager::render_GET(const HttpRequestPtr& req) {
             LogExcess(VB_COMMAND, "GET MQTT Publishing command: %s, payload: %s\n", topic.c_str(), TruncateForLog(payloadStr, 2000).c_str());
             Events::Publish(topic, payloadStr);
 
+            NoteDeprecatedCommandGet(command, getEffectiveClientIP(req));
+            auto deprecated = [](HttpResponsePtr resp) {
+                resp->addHeader("Deprecation", "true");
+                return resp;
+            };
+
             std::unique_ptr<Command::Result> r = invokeCommand(pinned.get(), args);
             int count = 0;
             while (!r->isDone() && count < 1000) {
@@ -924,11 +987,11 @@ HttpResponsePtr CommandManager::render_GET(const HttpRequestPtr& req) {
             }
             if (r->isDone()) {
                 if (r->isError()) {
-                    return makeStringResponse(r->get(), 500, "text/plain");
+                    return deprecated(makeStringResponse(r->get(), 500, "text/plain"));
                 }
-                return makeStringResponse(r->get(), 200, "text/plain");
+                return deprecated(makeStringResponse(r->get(), 200, "text/plain"));
             } else {
-                return makeStringResponse("Timeout running command", 500, "text/plain");
+                return deprecated(makeStringResponse("Timeout running command", 500, "text/plain"));
             }
         }
         WarningHolder::AddWarningTimeout(900, 61, "No command found for \"" + command + "\" - it may have come from a plugin that is no longer installed or was updated");
@@ -1166,6 +1229,9 @@ private:
 };
 
 int CommandManager::TriggerPreset(int slot, std::map<std::string, std::string>& keywords) {
+    if (slot < 1) {
+        return 0; // 0 is "no slot": never run every unslotted preset
+    }
     std::unique_lock<std::mutex> lock(presetsMutex);
     std::list<Json::Value> slotPresets;
     std::list<std::string> slotPresetNames;
@@ -1201,7 +1267,7 @@ int CommandManager::TriggerPreset(int slot, std::map<std::string, std::string>& 
         }
         ++nameIt;
     }
-    return 1;
+    return slotPresets.empty() ? 0 : 1;
 }
 
 int CommandManager::TriggerPreset(int slot) {

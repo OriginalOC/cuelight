@@ -44,7 +44,8 @@ static void exec(const std::string& cmd) {
         throw std::runtime_error("popen() failed!");
     }
     while (fgets(buffer.data(), buffer.size(), pipe.get()) != nullptr) {
-        printf(buffer.data());
+        // not printf(): the command's output is not a format string
+        fputs(buffer.data(), stdout);
     }
 }
 static std::string execAndReturn(const std::string& cmd) {
@@ -162,7 +163,7 @@ static std::string getRTCDev() {
         if (contains(drv, "omap_rtc")) {
             // built in OMAP RTC, (not battery backed, kind of useless)
             rtc = "/dev/rtc1";
-        } else if (contains("drv", " 0-00")) {
+        } else if (contains(drv, " 0-00")) {
             // Beaglebone Green Gateway has a ds1307 on i2c0
             // but no battery (by default) so cape would
             // be rtc1 and that's what we should use
@@ -206,8 +207,12 @@ int main(int argc, char* argv[]) {
         return 0;
     }
     int count = 0;
+    // Bounded at 1 s: with an RTC selected but no chip answering, the device
+    // never appears, and this oneshot unit holds up sysinit (and with it fppd
+    // and apache) for as long as it runs.
     while (!FileExists(rtc) && count < 100) {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        count++;
     }
     if (FileExists(rtc)) {
         std::string action = "get";
@@ -222,10 +227,14 @@ int main(int argc, char* argv[]) {
             if (contains(ret, "Remote I/O error")) {
                 removeI2CDevice(dev, getBus());
             } else {
-#if defined(PLATFORM_BBB) || defined(PLATFORMBB64)
-                // set the built in rtc to the same time as read from the RTC
-                if (rtc != "/dev/rtc0") {
-                    hwclock("-w", rtc.c_str());
+#if defined(PLATFORM_BBB) || defined(PLATFORM_BB64)
+                // Set the built-in RTC (rtc0, not battery backed) to the time
+                // just read from the cape's.  This wrote `rtc` -- the cape's
+                // own clock -- back to itself, and so never set the built-in
+                // one.  Only after a clean read (hwclock prints nothing then):
+                // otherwise the time copied would be the early-boot guess.
+                if (rtc != "/dev/rtc0" && ret.empty() && FileExists("/dev/rtc0")) {
+                    hwclock("-w", "/dev/rtc0");
                 }
 #endif
                 exec("cp /opt/fpp/etc/update-RTC /etc/cron.daily/");

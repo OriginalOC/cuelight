@@ -22,6 +22,7 @@
 #include <sys/epoll.h>
 #include <sys/prctl.h>
 #include <sys/sysinfo.h>
+#include <sys/uio.h>
 #include <syscall.h>
 #endif
 
@@ -88,6 +89,7 @@
 #include "channeltester/ChannelTester.h"
 #include "commands/Commands.h"
 #include "mediaoutput/AES67Manager.h"
+#include "mediaoutput/AudioLevelMonitor.h"
 #include "mediaoutput/OpusRTPManager.h"
 #include "mediaoutput/RTSPOutputManager.h"
 #include "mediaoutput/MediaOutputBase.h"
@@ -385,6 +387,10 @@ static void safeWriteFaultRegisters(int fd, void* ctx) {
     safeWriteReg(fd, "pc", (uintptr_t)uc->uc_mcontext.arm_pc);
     safeWriteReg(fd, "sp", (uintptr_t)uc->uc_mcontext.arm_sp);
     safeWriteReg(fd, "lr", (uintptr_t)uc->uc_mcontext.arm_lr);
+    // Bit 5 (T) says whether pc was running Thumb or ARM code, which is what
+    // decides how the bytes under "code at pc" disassemble: Debian's armhf is
+    // Thumb-2, Raspbian's is ARM.
+    safeWriteReg(fd, "cpsr", (uintptr_t)uc->uc_mcontext.arm_cpsr);
     safeWrite(fd, "\n");
     safeWriteReg(fd, "r0", (uintptr_t)uc->uc_mcontext.arm_r0);
     safeWriteReg(fd, "r1", (uintptr_t)uc->uc_mcontext.arm_r1);
@@ -403,6 +409,58 @@ static void safeWriteFaultRegisters(int fd, void* ctx) {
 #else
     (void)ctx;
     safeWrite(fd, "(register dump not implemented for this architecture)\n");
+#endif
+}
+
+// The instruction bytes around the faulting pc, as they were in memory.
+//
+// A SIGILL at an instruction that disassembles as perfectly valid in the
+// packaged library can only mean the bytes the CPU ran were not the packaged
+// ones -- a library damaged on disk, or overwritten under the running process.
+// Without the bytes that can only be argued from the stack; with them it is
+// a comparison.  generate_crash_report compares them against the file on disk.
+//
+// Read with process_vm_readv rather than by dereferencing pc: a jump to an
+// unmapped address is itself a common crash, and a fault in here would
+// re-enter the handler.  The syscall returns EFAULT instead, and reading our
+// own process needs no ptrace permission.  The two halves are read separately
+// so a pc at the start of a mapping still gets the bytes from pc onwards.
+static void safeWriteCodeAtFault(int fd, void* ctx) {
+#if defined(__linux__) && (defined(__aarch64__) || defined(__arm__) || defined(__x86_64__))
+    if (!ctx) {
+        return;
+    }
+    const ucontext_t* uc = (const ucontext_t*)ctx;
+#if defined(__aarch64__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.pc;
+#elif defined(__arm__)
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.arm_pc;
+#else
+    uintptr_t pc = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
+#endif
+    constexpr size_t kHalf = 16;
+    safeWrite(fd, "\n=== code at pc (memory order, pc-16 to pc+16) ===\n");
+    for (int half = 0; half < 2; half++) {
+        uintptr_t addr = half == 0 ? pc - kHalf : pc;
+        unsigned char buf[kHalf];
+        struct iovec local = { buf, kHalf };
+        struct iovec remote = { (void*)addr, kHalf };
+        ssize_t n = process_vm_readv(getpid(), &local, 1, &remote, 1, 0);
+        safeWriteHex(fd, addr);
+        safeWrite(fd, ":");
+        if (n != (ssize_t)kHalf) {
+            safeWrite(fd, " unreadable\n");
+            continue;
+        }
+        for (size_t i = 0; i < kHalf; i++) {
+            char hex[4] = { ' ', "0123456789abcdef"[buf[i] >> 4], "0123456789abcdef"[buf[i] & 0xF], '\0' };
+            safeWrite(fd, hex);
+        }
+        safeWrite(fd, "\n");
+    }
+#else
+    (void)fd;
+    (void)ctx;
 #endif
 }
 
@@ -613,6 +671,8 @@ static void handleCrash(int s, siginfo_t* si, void* ctx) {
             // the thread it happens to unwind, not necessarily the faulting
             // one, and this costs nothing.
             safeWriteFaultRegisters(cfd, ctx);
+            // Before the module map, which parsers read to the end of file.
+            safeWriteCodeAtFault(cfd, ctx);
             // Also written even when gdb succeeded, and this is the half that
             // was missing: gdb resolves what it can and leaves everything else
             // as a bare address, and a frame it fails to unwind past is simply
@@ -997,6 +1057,13 @@ void usage(char* appname) {
            appname);
 }
 
+// The "-v" volume, applied once fppd has daemonized.  Setting it while
+// parsing the arguments started the volume worker, which runs amixer and
+// pactl holding locks of its own, in the process that then forks into the
+// background: the daemon could inherit one of those locks held by a thread it
+// doesn't have, and never apply another volume change.
+static int s_argVolume = -1;
+
 int parseArguments(int argc, char** argv) {
     char* s = NULL;
     int c;
@@ -1063,7 +1130,8 @@ int parseArguments(int argc, char** argv) {
             SetSetting("resumeRepeat", atoi(optarg));
             break;
         case 'v': // volume
-            setVolume(atoi(optarg));
+            // Applied after daemonizing (see s_argVolume), not here.
+            s_argVolume = atoi(optarg);
             break;
         case 'm': // mode
             SetSetting("fppMode", optarg);
@@ -1095,13 +1163,14 @@ int parseArguments(int argc, char** argv) {
 
 // Workaround ASan bug 27790 (https://bugs.llvm.org//show_bug.cgi?id=27790)
 // by logging if LD_LIBRARY_PATH doesn't include the path to argv[0] (our binary).
-// This is because ASan intercepts dlopen and causes calls to dlopen to use ASan's
-// rpath instead of the rpath of the calling DSO. We cannot change the
-// LD_LIBRARY_PATH env var because the loader has already processed it by the time
-// that main() is called. We could fork()/execvpe(), but this has implications for
-// things like debugging that may be monitoring our pid.
+// This is because ASan (and TSan, which shares the interceptor) intercepts dlopen
+// and causes calls to dlopen to use the sanitizer's rpath instead of the rpath of
+// the calling DSO, so the libfpp-co-*.so output plugins are not found. We cannot
+// change the LD_LIBRARY_PATH env var because the loader has already processed it
+// by the time that main() is called. We could fork()/execvpe(), but this has
+// implications for things like debugging that may be monitoring our pid.
 bool checkASan(int argc, char** argv) {
-#if __SANITIZE_ADDRESS__
+#if __SANITIZE_ADDRESS__ || __SANITIZE_THREAD__
     {
         struct FreeString {
             void operator()(char* p) {
@@ -1134,7 +1203,7 @@ bool checkASan(int argc, char** argv) {
         }
 
         if (!found) {
-            constexpr static char str[] = "When built with ASan, LD_LIBRARY_PATH must be set to include the path to fppd. Exiting.\n";
+            constexpr static char str[] = "When built with ASan or TSan, LD_LIBRARY_PATH must be set to include the path to fppd. Exiting.\n";
             LogErr(VB_GENERAL, str);
             fprintf(stderr, str);
             return false;
@@ -1182,6 +1251,25 @@ int main(int argc, char* argv[]) {
     // Initialize Magick, but we don't want the Magick signal handlers as they interfere with our own
     MagickLib::InitializeMagickEx(nullptr, MAGICK_OPT_NO_SIGNAL_HANDER, nullptr);
     Magick::InitializeMagick(NULL);
+    // Cap the size of any image decoded in fppd (overlay image uploads over
+    // HTTP, Image effects, playlist images, virtual display backgrounds).
+    // GraphicsMagick allocates whatever the image header asks for: a 1 MB PNG
+    // claiming 30000x30000 took 4+ GB and fppd was OOM-killed.  A header past
+    // this limit now fails to read.  Only the pixel count is capped, not the
+    // width or height: the limits apply to every image fppd makes, and the
+    // Text effect draws a long message as one strip tens of thousands of
+    // pixels wide (it bounds its own size).  The cap is a quarter of RAM in
+    // pixel cache (8 bytes a pixel at QuantumDepth 16), up to 128M pixels (a
+    // 61 MP camera photo fits on a 4 GB Pi).  There is no floor above that
+    // rule: on a 512 MB BeagleBone a quarter is 16M pixels, which still fits
+    // a 12 MP photo, and the 32M floor this once had let a 4 KB PNG take
+    // over 300 MB there, an OOM kill.  32M only when RAM can't be read.
+    {
+        long long ram = (long long)sysconf(_SC_PHYS_PAGES) * sysconf(_SC_PAGESIZE);
+        long long pixels = ram > 0 ? ram / 4 / 8 : 32LL * 1024 * 1024;
+        pixels = std::min(pixels, 128LL * 1024 * 1024);
+        MagickLib::SetMagickResourceLimit(MagickLib::PixelsResource, (MagickLib::magick_int64_t)pixels);
+    }
 
     // Parse our arguments first, override any defaults
     parseArguments(argc, argv);
@@ -1208,6 +1296,9 @@ int main(int argc, char* argv[]) {
     // Start functioning
     if (getSettingInt("daemonize")) {
         CreateDaemon();
+    }
+    if (s_argVolume >= 0) {
+        setVolume(s_argVolume);
     }
     PLAT_GPIO_CLASS* gpioUtil = new PLAT_GPIO_CLASS();
     PinCapabilities::InitGPIO("FPPD", gpioUtil);
@@ -1250,10 +1341,10 @@ int main(int argc, char* argv[]) {
 
             if (0 == topic_in.compare(topic_in.length() - 9, 9, "/shutdown")) {
                 LogInfo(VB_CONTROL, "Shutting down OS for request:   %s\n", topic_in.c_str());
-                urlGet("http://localhost/api/system/shutdown", rc);
+                urlPost("http://localhost/api/system/shutdown", "", rc);
             } else if (0 == topic_in.compare(topic_in.length() - 8, 8, "/restart")) {
                 LogInfo(VB_CONTROL, "Restarting FPP for request:   %s\n", topic_in.c_str());
-                urlGet("http://localhost/api/system/reboot", rc);
+                urlPost("http://localhost/api/system/reboot", "", rc);
             } else {
                 LogWarn(VB_CONTROL, "Invalid  request in mqtt_system_callback  %s\n", topic_in.c_str());
             }
@@ -1380,6 +1471,12 @@ int main(int argc, char* argv[]) {
     // discovery clients won't keep our entries cached for the TTL.
     MDNSManager::INSTANCE.Cleanup();
 
+#ifdef HAS_AUDIO_LEVEL_MONITOR
+    // Its poll thread reads the level elements of the pipelines torn down
+    // below; stop it, and drop the meters, first.  Nothing else ever joined
+    // that thread, so it outlived the pipelines and was never reaped.
+    AudioLevelMonitor::INSTANCE.Shutdown();
+#endif
 #ifdef HAS_RTSP_OUTPUT_GSTREAMER
     // Before the video managers it reads from, so no client is still being
     // served off an intervideo channel that is about to go away.
@@ -2319,17 +2416,27 @@ void MainLoop(void) {
     LogInfo(VB_GENERAL, "Main Loop complete, shutting down.\n");
 }
 
+// Each process CreateDaemon() leaves behind exits without running static
+// destructors: they belong to the daemon.  A destructor can block on a thread
+// started before the fork: glibc's pthread_cond_destroy() waits for its
+// waiters, and when "-v" started the volume worker that early, exit() never
+// returned and whatever ran "fppd -d" never saw its process end.
+static void LeaveForkedProcess(int code) {
+    fflush(nullptr);
+    _exit(code);
+}
+
 void CreateDaemon(void) {
     /* Fork and terminate parent so we can run in the background */
     /* Fork off the parent process */
     pid = fork();
     if (pid < 0) {
-        exit(EXIT_FAILURE);
+        LeaveForkedProcess(EXIT_FAILURE);
     }
     /* If we got a good PID, then
         we can exit the parent process. */
     if (pid > 0) {
-        exit(EXIT_SUCCESS);
+        LeaveForkedProcess(EXIT_SUCCESS);
     }
 
     /* Change the file mode mask */
@@ -2339,25 +2446,33 @@ void CreateDaemon(void) {
     sid = setsid();
     if (sid < 0) {
         /* Log any failures here */
-        exit(EXIT_FAILURE);
+        LeaveForkedProcess(EXIT_FAILURE);
     }
 
     /* Fork a second time to get rid of session leader */
     /* Fork off the parent process */
     pid = fork();
     if (pid < 0) {
-        exit(EXIT_FAILURE);
+        LeaveForkedProcess(EXIT_FAILURE);
     }
     /* If we got a good PID, then
       we can exit the parent process. */
     if (pid > 0) {
-        exit(EXIT_SUCCESS);
+        LeaveForkedProcess(EXIT_SUCCESS);
     }
 
-    /* Close out the standard file descriptors */
-    close(STDIN_FILENO);
-    close(STDOUT_FILENO);
-    close(STDERR_FILENO);
+    /* Point the standard file descriptors at /dev/null.  Closed, they were
+       taken by whatever fppd opened next (see OpenStandardDescriptors() in
+       common_mini.cpp) */
+    int devNull = open("/dev/null", O_RDWR);
+    if (devNull >= 0) {
+        dup2(devNull, STDIN_FILENO);
+        dup2(devNull, STDOUT_FILENO);
+        dup2(devNull, STDERR_FILENO);
+        if (devNull > STDERR_FILENO) {
+            close(devNull);
+        }
+    }
 }
 
 void PublishStatsForce(std::string reason) {

@@ -164,7 +164,7 @@ function StopFppdPlaybackSafe($timeoutSec = 3)
 
     // Stop playback with timeout — if fppd hangs during GStreamer teardown
     // the context timeout prevents PHP from blocking forever.
-    @file_get_contents('http://localhost:32322/command/Stop%20Now', false, $ctx);
+    FppdCommand('Stop Now', array(), $timeoutSec * 1000, $timeoutSec);
 
     // Wait for fppd to release PipeWire streams
     usleep(500000);
@@ -709,9 +709,7 @@ function ApplyPipeWireAudioGroups($overrideData = null, $skipRestart = false)
     if ($wasPlaying && !empty($resumePlaylist)) {
         usleep(500000);
         $repeat = $resumeRepeat ? 'true' : 'false';
-        $ctx = stream_context_create(array('http' => array('timeout' => 5)));
-        @file_get_contents('http://localhost:32322/command/Start%20Playlist/'
-            . rawurlencode($resumePlaylist) . '/' . $repeat, false, $ctx);
+        FppdCommand('Start Playlist', array($resumePlaylist, $repeat), 5000, 5);
     }
 
     return json(array(
@@ -1878,7 +1876,7 @@ function StartSyncCalibration()
         // Resolve the file under the music directory; reject anything escaping it.
         $musicDir = $settings['mediaDirectory'] . "/music";
         $resolved = realpath($musicDir . "/" . $mediaFile);
-        if ($resolved === false || strpos($resolved, realpath($musicDir)) !== 0 || !is_file($resolved)) {
+        if ($resolved === false || !PathIsWithin($resolved, realpath($musicDir)) || !is_file($resolved)) {
             return json(array("status" => "ERROR", "message" => "Media file not found: " . $mediaFile));
         }
         return StartSyncCalibrationPlayback($sinkName, $resolved, false);
@@ -2033,8 +2031,9 @@ function StopSyncCalibrationInternal()
 
     // Also stop any legacy fppd-driven click track in case an older session
     // started one before this fix shipped.
-    $url = FPPSelfBaseURL() . '/api/command/Stop%20Media/fpp_sync_click.wav';
-    $ctx = stream_context_create(array('http' => array('method' => 'GET', 'timeout' => 5)));
+    $url = FPPSelfBaseURL() . '/api/command/Stop%20Media';
+    $ctx = stream_context_create(array('http' => array('method' => 'POST', 'timeout' => 5,
+        'header' => "Content-Type: application/json\r\n", 'content' => '["fpp_sync_click.wav"]')));
     @file_get_contents($url, false, $ctx);
 }
 
@@ -2345,9 +2344,7 @@ function ApplyPipeWireInputGroups($skipRestart = false)
     if ($wasPlaying && !empty($resumePlaylist)) {
         usleep(500000);
         $repeat = $resumeRepeat ? 'true' : 'false';
-        $ctx = stream_context_create(array('http' => array('timeout' => 5)));
-        @file_get_contents('http://localhost:32322/command/Start%20Playlist/'
-            . rawurlencode($resumePlaylist) . '/' . $repeat, false, $ctx);
+        FppdCommand('Start Playlist', array($resumePlaylist, $repeat), 5000, 5);
     }
 
     return json(array(
@@ -2750,9 +2747,10 @@ function SetStreamSlotVolume($bodyOverride = null)
             "message" => "fppd did not accept the slot volume command (HTTP $code)"));
     }
 
-    // An idle slot has no stream to apply to; the value is saved either way and
-    // takes effect when it next plays.
-    return json(array("status" => "OK", "slot" => $slot, "volume" => $volume));
+    // An idle slot has no stream to apply to: fppd accepts it for the slot's
+    // next start, and its answer says so.
+    return json(array("status" => "OK", "slot" => $slot, "volume" => $volume,
+        "message" => trim($result)));
 }
 
 /////////////////////////////////////////////////////////////////////////////
@@ -4992,7 +4990,9 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
                 $opusCfgFile = $settings['mediaDirectory'] . "/config/pipewire-opus-rtp-instances.json";
                 $sourceTarget = '';
                 if (file_exists($opusCfgFile)) {
-                    $opusCfg = json_decode(file_get_contents($opusCfgFile), true);
+                    // Read here, after the top-of-function sanitize: the
+                    // instance name is written into a comment and a string.
+                    $opusCfg = PwConfSanitize(json_decode(file_get_contents($opusCfgFile), true));
                     if ($opusCfg && isset($opusCfg['instances'])) {
                         foreach ($opusCfg['instances'] as $oi) {
                             if (isset($oi['id']) && intval($oi['id']) === $opusInstId && !empty($oi['enabled'])) {
@@ -5021,7 +5021,9 @@ function GeneratePipeWireInputGroupsConfig($inputGroups, $outputGroups)
                 $vbanCfgFile = $settings['mediaDirectory'] . "/config/pipewire-vban-instances.json";
                 $sourceTarget = '';
                 if (file_exists($vbanCfgFile)) {
-                    $vbanCfg = json_decode(file_get_contents($vbanCfgFile), true);
+                    // Sanitized as GenerateVBANConfig() does, so the node name
+                    // matches it and the name stays inside its comment and string.
+                    $vbanCfg = PwConfSanitize(json_decode(file_get_contents($vbanCfgFile), true));
                     if ($vbanCfg && isset($vbanCfg['instances'])) {
                         foreach ($vbanCfg['instances'] as $vi) {
                             if (isset($vi['id']) && intval($vi['id']) === $vbanInstId && !empty($vi['enabled'])) {
@@ -6501,8 +6503,10 @@ function SaveAES67Instances()
             $inst['channels'] = 2;
         if (empty($inst['sessionName']))
             $inst['sessionName'] = $inst['name'];
+        // AES67::DEFAULT_PTIME_MS -- what fppd uses for an instance with no
+        // ptime, and what the page offers as the default.
         if (!isset($inst['ptime']))
-            $inst['ptime'] = 4;
+            $inst['ptime'] = 1;
         if (!isset($inst['latency']))
             $inst['latency'] = 10;
         if (!isset($inst['sapEnabled']))
@@ -6606,7 +6610,9 @@ function SignalFPPDCommand($command, $timeoutSeconds = 120)
     $url = 'http://localhost:32322/command/' . rawurlencode($command);
     $ctx = stream_context_create(array(
         'http' => array(
-            'method' => 'GET',
+            'method' => 'POST',
+            'header' => "Content-Type: application/json\r\n",
+            'content' => '[]',
             'timeout' => $timeoutSeconds,
             'ignore_errors' => true
         )
@@ -6978,6 +6984,10 @@ function SaveOpusRTPInstances()
         http_response_code(400);
         return json(array("status" => "ERROR", "message" => "Missing instances array"));
     }
+    // Store names the way the generators will write them (PwConfSanitize()),
+    // so the node names fppd derives from the saved names match the generated
+    // config.
+    $parsed = PwConfSanitize($parsed);
     $nextId = 1;
     foreach ($parsed['instances'] as &$inst) {
         if (!isset($inst['id'])) {

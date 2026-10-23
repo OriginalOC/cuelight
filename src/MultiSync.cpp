@@ -97,6 +97,23 @@ static std::mutex s_controlSockOpenLock;
 // queue grows faster than it drains.  Guarded by m_httpProbeLock.
 static std::set<std::string> s_httpPingPending;
 
+// The most HTTP re-pings that may wait in the queue.  Every path that queues
+// one is fed from the network, and the Twinkly discovery replies by anyone
+// on the LAN, so the queue needs a bound of its own; real remotes and lights
+// come to far fewer.
+#define HTTP_PING_MAX_QUEUED 512
+
+// caller holds m_httpProbeLock
+static void QueueHTTPPing(std::deque<std::string>& queue, const std::string& address) {
+    if (queue.size() >= HTTP_PING_MAX_QUEUED) {
+        LogDebug(VB_SYNC, "Not probing %s over HTTP: %d probes already queued\n", address.c_str(), (int)queue.size());
+        return;
+    }
+    if (s_httpPingPending.insert(address).second) {
+        queue.push_back(address);
+    }
+}
+
 MultiSync MultiSync::INSTANCE;
 MultiSync* multiSync = &MultiSync::INSTANCE;
 
@@ -143,6 +160,33 @@ static bool GetIPForHost(std::string& target) {
 // 169.254/16: what an interface holds when DHCP hasn't answered (yet).
 static bool IsIPv4LinkLocal(const std::string& address) {
     return startsWith(address, "169.254.");
+}
+
+// Adds the hosts in a comma-separated remote list setting (MultiSyncRemotes,
+// MultiSyncExtraRemotes) to `remotes`.  Quotes are stripped from each end of an
+// entry on its own, not only as a pair: the web UI used to PUT
+// MultiSyncRemotes as a JSON string, which stores the whole list quoted
+// ("a,b,c", so the first entry has only an opening quote and the last only a
+// closing one) and an empty list as a bare pair of quotes, while an entry
+// typed with its own quotes has both.  Left in, a quote fails inet_addr(), and
+// a lone "" becomes a host name that costs a full DNS timeout (~4s, on the
+// settings-reload thread) on every reload.
+static void AddRemotesFromSetting(const char* setting, std::set<std::string>& remotes) {
+    for (auto& token : split(getSetting(setting), ',')) {
+        TrimWhiteSpace(token);
+        while (!token.empty() && (token.front() == '"' || token.back() == '"')) {
+            if (token.front() == '"') {
+                token.erase(0, 1);
+            }
+            if (!token.empty() && token.back() == '"') {
+                token.pop_back();
+            }
+            TrimWhiteSpace(token);
+        }
+        if (token != "") {
+            remotes.insert(token);
+        }
+    }
 }
 
 // Whether `sys` is the device reporting (hostname, fppMode, type, uuid) from
@@ -1321,6 +1365,15 @@ Json::Value MultiSync::GetSystems(bool localOnly, bool timestamps) {
     return result;
 }
 
+// The packet counters are bumped as packets are processed, on the main loop,
+// without m_statsLock (only the lookup of a sender's stats takes it), while
+// GetSyncStats() reads them and ResetSyncStats() zeroes them from API threads.
+// So every access is a relaxed atomic one; MultiSyncStats keeps plain fields,
+// as MultiSync.h is a plugin-facing header.
+static inline void BumpStat(uint32_t& c) {
+    __atomic_fetch_add(&c, 1, __ATOMIC_RELAXED);
+}
+
 Json::Value MultiSync::GetSyncStats() {
     Json::Value result;
     Json::Value systems(Json::arrayValue);
@@ -1357,20 +1410,20 @@ void MultiSync::ResetSyncStats() {
     std::unique_lock<std::recursive_mutex> slock(m_statsLock);
     for (auto& a : m_syncStats) {
         MultiSyncStats* stats = (MultiSyncStats*)a.second;
-        stats->pktCommand = 0;
-        stats->pktSyncSeqOpen = 0;
-        stats->pktSyncSeqStart = 0;
-        stats->pktSyncSeqStop = 0;
-        stats->pktSyncSeqSync = 0;
-        stats->pktSyncMedOpen = 0;
-        stats->pktSyncMedStart = 0;
-        stats->pktSyncMedStop = 0;
-        stats->pktSyncMedSync = 0;
-        stats->pktBlank = 0;
-        stats->pktPing = 0;
-        stats->pktPlugin = 0;
-        stats->pktFPPCommand = 0;
-        stats->pktError = 0;
+        __atomic_store_n(&stats->pktCommand, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncSeqOpen, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncSeqStart, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncSeqStop, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncSeqSync, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncMedOpen, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncMedStart, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncMedStop, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktSyncMedSync, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktBlank, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktPing, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktPlugin, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktFPPCommand, 0, __ATOMIC_RELAXED);
+        __atomic_store_n(&stats->pktError, 0, __ATOMIC_RELAXED);
     }
 }
 
@@ -1507,12 +1560,21 @@ void MultiSync::PerformHTTPDiscovery() {
 // invalidate the token a running Twinkly channel output is streaming with.
 #define TWINKLY_DISCOVERY_PORT 5555
 static const char TWINKLY_DISCOVERY_MSG[] = { 0x01, 'd', 'i', 's', 'c', 'o', 'v', 'e', 'r' };
+// Replies are taken only this long after a discovery broadcast, and from at
+// most this many addresses per broadcast.  The socket stays open for the life
+// of fppd and its port is in every broadcast, so without them any host on the
+// LAN could grow the seen set and the probe queue by one entry per source
+// address it sent from, for as long as fppd ran.  The lights answer within
+// milliseconds.
+#define TWINKLY_REPLY_WINDOW_MS 5000
+#define TWINKLY_MAX_REPLIES 128
+static std::atomic<long long> s_twinklyRepliesUntilMS{ 0 };
 
 bool MultiSync::OpenTwinklyDiscoverySocket() {
     if (m_twinklyDiscoverySock >= 0) {
         return true;
     }
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         LogWarn(VB_SYNC, "Could not open Twinkly discovery socket: %s\n", FPPstrerror(errno));
         return false;
@@ -1539,6 +1601,7 @@ void MultiSync::PerformTwinklyDiscovery() {
         std::unique_lock<std::mutex> lock(m_httpProbeLock);
         m_twinklyDiscoverySeen.clear();
     }
+    s_twinklyRepliesUntilMS = GetMonotonicTimeMS() + TWINKLY_REPLY_WINDOW_MS;
 
     // Under m_socketLock, which the sync sends need every frame: never block.
     std::unique_lock<std::mutex> lock(m_socketLock);
@@ -1568,7 +1631,9 @@ void MultiSync::PerformTwinklyDiscovery() {
 // signal that bridge data is ready to push out, which this is not.
 bool MultiSync::ProcessTwinklyDiscoveryReplies() {
     char buf[256];
-    while (true) {
+    // a bounded number of replies a wakeup, like the other sockets the main
+    // loop reads; the socket is level-triggered, so the rest come next pass
+    for (int n = 0; n < 1024; n++) {
         struct sockaddr_in src;
         memset(&src, 0, sizeof(src));
         socklen_t slen = sizeof(src);
@@ -1577,7 +1642,7 @@ bool MultiSync::ProcessTwinklyDiscoveryReplies() {
         if (len <= 0) {
             return false;
         }
-        if (len < 7 || buf[4] != 'O' || buf[5] != 'K') {
+        if (len < 7 || buf[4] != 'O' || buf[5] != 'K' || GetMonotonicTimeMS() > s_twinklyRepliesUntilMS) {
             continue;
         }
         char ipStr[INET_ADDRSTRLEN] = { 0 };
@@ -1587,15 +1652,26 @@ bool MultiSync::ProcessTwinklyDiscoveryReplies() {
         std::string address(ipStr);
         {
             std::unique_lock<std::mutex> lock(m_httpProbeLock);
+            if (m_twinklyDiscoverySeen.size() >= TWINKLY_MAX_REPLIES) {
+                continue;
+            }
             if (!m_twinklyDiscoverySeen.insert(address).second) {
                 // the lights answer each broadcast more than once
                 continue;
             }
         }
         LogInfo(VB_SYNC, "Twinkly device answered discovery at %s\n", address.c_str());
-        // Not under any lock: this queues an HTTP probe and can complete inline.
-        PingSingleRemoteViaHTTP(address);
+        // Through the queue, under the in-flight cap.  Started directly, one
+        // per answering address, a burst of replies -- or of datagrams
+        // claiming to be replies, from as many addresses -- started that many
+        // HTTP probes at once.
+        {
+            std::unique_lock<std::mutex> lock(m_httpProbeLock);
+            QueueHTTPPing(m_httpPingQueue, address);
+        }
+        PumpHTTPPings();
     }
+    return false;
 }
 
 void MultiSync::DiscoverIPViaHTTP(const std::string& ip, const std::string& html, bool allowUnknown) {
@@ -1650,6 +1726,9 @@ void MultiSync::DiscoverIPViaHTTP(const std::string& ip, const std::string& html
 // than CurlManager's defaults for the reason above: most addresses are dead.
 static void discoveryGet(const std::string& url, std::function<void(int rc, const std::string& resp)>&& callback) {
     CURL* curl = CurlManager::INSTANCE.createCurl(url);
+    // a device merely on the LAN can stream an endless body; detection only
+    // ever looks at the start of a page, so a cut-off one is still fine
+    CurlManager::limitResponseSize(curl);
     curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT_MS, 1000L);
     curl_easy_setopt(curl, CURLOPT_TIMEOUT_MS, 5000L);
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -1801,16 +1880,10 @@ void MultiSync::Ping(int discover, bool broadcast) {
     }
 
     if (discover) {
-        std::string extraRemotes = getSetting("MultiSyncExtraRemotes");
-        if (extraRemotes != "") {
-            std::vector<std::string> tokens = split(extraRemotes, ',');
-            std::set<std::string> remotes;
-            for (auto& token : tokens) {
-                TrimWhiteSpace(token);
-                if (token != "") {
-                    PingSingleRemote(token.c_str(), 1);
-                }
-            }
+        std::set<std::string> remotes;
+        AddRemotesFromSetting("MultiSyncExtraRemotes", remotes);
+        for (auto& remote : remotes) {
+            PingSingleRemote(remote.c_str(), 1);
         }
     }
 }
@@ -1903,9 +1976,7 @@ void MultiSync::PeriodicPing() {
             {
                 std::unique_lock<std::mutex> plock(m_httpProbeLock);
                 for (auto& address : httpPingAddresses) {
-                    if (s_httpPingPending.insert(address).second) {
-                        m_httpPingQueue.push_back(address);
-                    }
+                    QueueHTTPPing(m_httpPingQueue, address);
                 }
             }
             PumpHTTPPings();
@@ -2105,6 +2176,12 @@ void MultiSync::ApplyPeerUUIDs(const std::map<std::string, std::string>& peerUUI
     std::unique_lock<std::recursive_mutex> lock(m_systemsLock);
     for (const auto& [addr, uuid] : peerUUIDs) {
         if (!addr.empty() && !uuid.empty()) {
+            // One device's reply decides how many entries it lists, so a
+            // device (or anything answering as one) could grow this for good.
+            // Far more than any network's worth of devices.
+            if (m_peerUUIDHints.size() >= 4096 && !m_peerUUIDHints.contains(addr)) {
+                continue;
+            }
             m_peerUUIDHints[addr] = uuid;
         }
     }
@@ -2508,8 +2585,8 @@ void MultiSync::SendSeqOpenPacket(const std::string& filename) {
     for (auto a : getPluginsCopy()) {
         a->SendSeqOpenPacket(filename);
     }
-    m_lastFrame = -1;
-    m_lastFrameSent = -1;
+    __atomic_store_n(&m_lastFrame, -1, __ATOMIC_RELAXED);
+    __atomic_store_n(&m_lastFrameSent, -1, __ATOMIC_RELAXED);
 
     char outBuf[2048];
     bzero(outBuf, sizeof(outBuf));
@@ -2549,8 +2626,8 @@ void MultiSync::SendSeqSyncStartPacket(const std::string& filename) {
     for (auto a : getPluginsCopy()) {
         a->SendSeqSyncStartPacket(filename);
     }
-    m_lastFrame = -1;
-    m_lastFrameSent = -1;
+    __atomic_store_n(&m_lastFrame, -1, __ATOMIC_RELAXED);
+    __atomic_store_n(&m_lastFrameSent, -1, __ATOMIC_RELAXED);
 
     char outBuf[2048];
     bzero(outBuf, sizeof(outBuf));
@@ -2612,8 +2689,8 @@ void MultiSync::SendSeqSyncStopPacket(const std::string& filename) {
 
     SendControlPacket(outBuf, sizeof(ControlPkt) + sizeof(SyncPkt) + filename.length());
 
-    m_lastFrame = -1;
-    m_lastFrameSent = -1;
+    __atomic_store_n(&m_lastFrame, -1, __ATOMIC_RELAXED);
+    __atomic_store_n(&m_lastFrameSent, -1, __ATOMIC_RELAXED);
 }
 
 /*
@@ -2634,8 +2711,12 @@ void MultiSync::SendSeqSyncPacket(const std::string& filename, int frames, float
     for (auto a : getPluginsCopy()) {
         a->SendSeqSyncPacket(filename, frames, seconds);
     }
-    m_lastFrame = frames;
-    int diff = frames - m_lastFrameSent;
+    // The output thread sends these while the sequence's open, start and
+    // stop -- on the playlist's thread -- reset them, so every access is a
+    // relaxed atomic one (the members are plain ints in a plugin-facing
+    // header).
+    __atomic_store_n(&m_lastFrame, frames, __ATOMIC_RELAXED);
+    int diff = frames - __atomic_load_n(&m_lastFrameSent, __ATOMIC_RELAXED);
     if (frames > 32) {
         // after 32 frames, we send every 10
         //  that's either twice a second (50ms sequences) or 4 times (25ms)
@@ -2646,7 +2727,7 @@ void MultiSync::SendSeqSyncPacket(const std::string& filename, int frames, float
         // under 32 frames, we send every 4
         return;
     }
-    m_lastFrameSent = frames;
+    __atomic_store_n(&m_lastFrameSent, frames, __ATOMIC_RELAXED);
 
     LogDebug(VB_SYNC, "SendSeqSyncPacket( '%s', %d, %.2f)\n",
              filename.c_str(), frames, seconds);
@@ -2986,7 +3067,7 @@ void MultiSync::ShutdownSync(void) {
 int MultiSync::OpenBroadcastSocket(void) {
     LogDebug(VB_SYNC, "OpenBroadcastSocket()\n");
 
-    m_broadcastSock = socket(AF_INET, SOCK_DGRAM, 0);
+    m_broadcastSock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
 
     if (m_broadcastSock < 0) {
         LogErr(VB_SYNC, "Error opening MultiSync broadcast socket\n");
@@ -3023,7 +3104,7 @@ int MultiSync::OpenControlSockets() {
     // Set the socket up fully before publishing it, so a sender never sees a
     // half-configured one, and a failed setsockopt() doesn't leave it behind
     // as if the open had succeeded.
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
 
     if (sock < 0) {
         LogErr(VB_SYNC, "Error opening MultiSync socket\n");
@@ -3065,42 +3146,19 @@ void MultiSync::ReloadSyncDestinations() {
     // remote list under m_systemsLock and then takes this lock itself.
     std::unique_lock<std::mutex> updateLock(m_unicastUpdateLock);
 
-    std::string remotesString = getSetting("MultiSyncRemotes");
-    std::string extraRemotes = getSetting("MultiSyncExtraRemotes");
-    if (extraRemotes != "") {
-        if (remotesString == "") {
-            remotesString = extraRemotes;
-        } else {
-            remotesString += ",";
-            remotesString += extraRemotes;
-        }
-    }
-
-    std::vector<std::string> tokens = split(remotesString, ',');
     std::set<std::string> remotes;
-    for (auto& token : tokens) {
-        TrimWhiteSpace(token);
-        // The web UI PUTs this setting as a JSON string, so an empty list is
-        // stored as a literal pair of quote characters rather than as an empty
-        // value.  Left in, that becomes a "hostname" of "" and every reload
-        // spends a full DNS timeout (~4s, on the settings-reload thread)
-        // failing to resolve it.
-        while (token.size() >= 2 && token.front() == '"' && token.back() == '"') {
-            token = token.substr(1, token.size() - 2);
-            TrimWhiteSpace(token);
-        }
-        if (token != "") {
-            remotes.insert(token);
-        }
-    }
+    AddRemotesFromSetting("MultiSyncRemotes", remotes);
+    AddRemotesFromSetting("MultiSyncExtraRemotes", remotes);
 
     // Assign rather than |=: this runs again on every settings change, so a
     // method the user just turned off has to go back to false.
     bool sendBroadcast = getSettingInt("MultiSyncBroadcast") != 0;
     bool sendMulticast = getSettingInt("MultiSyncMulticast") != 0;
     bool sendUnicast = getSettingInt("MultiSyncUnicast") != 0;
-    if (remotesString == "" && !sendBroadcast && !sendMulticast && !sendUnicast && m_multiSyncEnabled) {
+    if (remotes.empty() && !sendBroadcast && !sendMulticast && !sendUnicast && m_multiSyncEnabled) {
         // No explicit remotes or send method configured; default to multicast.
+        // A list that names no host (only quotes or commas, which is how the
+        // old UI saved an empty one) counts as no remotes.
         sendMulticast = true;
     }
 
@@ -3379,9 +3437,6 @@ static bool IsOwnEcho(const void* buf, int len) {
 }
 
 void MultiSync::SendControlPacket(void* outBuf, int len) {
-    if (IsEchoCandidate(outBuf, len)) {
-        RememberOwnSend(outBuf, len);
-    }
     if (WillLog(LOG_EXCESSIVE, VB_SYNC)) {
         LogExcess(VB_SYNC, "SendControlPacket()\n");
         HexDump("Sending Control packet with contents:", outBuf, len, VB_SYNC);
@@ -3498,6 +3553,7 @@ void MultiSync::SendBroadcastPacket(void* outBuf, int len) {
         HexDump("Sending Broadcast packet with contents:", outBuf, len, VB_SYNC);
     }
 
+    bool echoes = IsEchoCandidate(outBuf, len);
     std::unique_lock<std::mutex> lock(m_socketLock);
     long long startTime = GetMonotonicTimeMS();
     for (auto& a : m_interfaces) {
@@ -3506,6 +3562,12 @@ void MultiSync::SendBroadcastPacket(void* outBuf, int len) {
         bda.sin_family = AF_INET;
         bda.sin_port = htons(FPP_CTRL_PORT);
         bda.sin_addr.s_addr = a.second.broadcastAddress;
+
+        // One datagram per interface, and each comes back to us: remember
+        // each one, or the second interface's echo runs the command again.
+        if (echoes) {
+            RememberOwnSend(outBuf, len);
+        }
 
         if (int err = SendDatagramBounded(m_broadcastSock, outBuf, len, bda, startTime))
             LogSendFailure(err);
@@ -3523,7 +3585,7 @@ void MultiSync::SendMulticastPacket(void* outBuf, int len) {
 
         if (a.second.multicastSocket == -1) {
             // create the socket
-            a.second.multicastSocket = socket(AF_INET, SOCK_DGRAM, 0);
+            a.second.multicastSocket = OpenSocket(AF_INET, SOCK_DGRAM, 0);
 
             if (a.second.multicastSocket < 0) {
                 LogErr(VB_SYNC, "Error opening Multicast socket for %s\n", a.second.interfaceName.c_str());
@@ -3571,7 +3633,7 @@ void MultiSync::SendUnicastPacket(const std::string& address, void* outBuf, int 
     if (m_controlSock >= 0) {
         sendto(m_controlSock, outBuf, len, MSG_DONTWAIT, (struct sockaddr*)&dest_addr, sizeof(dest_addr));
     } else {
-        int uSock = socket(AF_INET, SOCK_DGRAM, 0);
+        int uSock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
         if (uSock < 0) {
             LogErr(VB_SYNC, "Error opening Unicast socket\n");
             return;
@@ -3685,13 +3747,23 @@ int MultiSync::OpenReceiveSocket(void) {
     char strMulticastGroup[16];
 
     /* set up socket */
-    m_receiveSock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    m_receiveSock = OpenSocket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (m_receiveSock < 0) {
         LogErr(VB_SYNC, "Error opening Receive socket; %s\n", FPPstrerror(errno));
         WarningHolder::AddWarning(42, "MultiSync: could not open receive socket");
         return 0;
     }
     LogDebug(VB_SYNC, "Receive socket: %d\n", m_receiveSock);
+
+    // The default buffer (212992 bytes) holds about 166 datagrams -- each
+    // costs ~1.3KB of it whatever its size -- so any stall of the main loop
+    // (an output reload, a burst of pings from a large show) dropped sync and
+    // ping packets in the kernel.  1MB (the kernel doubles it) holds ~1600;
+    // fppinit raises rmem_max to 8MB, so the request isn't clamped.
+    int rcvBuf = 1024 * 1024;
+    if (setsockopt(m_receiveSock, SOL_SOCKET, SO_RCVBUF, &rcvBuf, sizeof(rcvBuf)) < 0) {
+        LogWarn(VB_SYNC, "Error setting SO_RCVBUF on the receive socket; %s\n", FPPstrerror(errno));
+    }
 
     bzero((char*)&m_receiveSrcAddr, sizeof(m_receiveSrcAddr));
     m_receiveSrcAddr.sin_family = AF_INET;
@@ -3818,6 +3890,10 @@ void MultiSync::ProcessControlPacket(bool pingOnly) {
     ControlPkt* pkt;
 
     int msgcnt = recvmmsg(m_receiveSock, rcvMsgs, MAX_MS_RCV_MSG, MSG_DONTWAIT, nullptr);
+    // Batches read per wakeup: the socket is level-triggered, so the rest is
+    // read on the next pass.  Draining until empty let a flood of packets keep
+    // the main loop in here for as long as it lasted.
+    int batches = 1;
     while (msgcnt > 0) {
         // One entry per received message, buffer and length, so that the
         // indexes shouldSkipPacket() walks are the same msg indexes used below.
@@ -3948,7 +4024,7 @@ void MultiSync::ProcessControlPacket(bool pingOnly) {
                         for (auto a : getPluginsCopy()) {
                             a->ReceivedBlankingDataPacket();
                         }
-                        stats->pktBlank++;
+                        BumpStat(stats->pktBlank);
                         sequence->SendBlankingData();
                     }
                     break;
@@ -3969,7 +4045,7 @@ void MultiSync::ProcessControlPacket(bool pingOnly) {
                 }
             }
         }
-        msgcnt = recvmmsg(m_receiveSock, rcvMsgs, MAX_MS_RCV_MSG, MSG_DONTWAIT, nullptr);
+        msgcnt = ++batches > 64 ? 0 : recvmmsg(m_receiveSock, rcvMsgs, MAX_MS_RCV_MSG, MSG_DONTWAIT, nullptr);
     }
 }
 
@@ -4094,13 +4170,15 @@ void MultiSync::SyncSyncedSequence(const std::string& filename, int frameNumber,
         sequence->StartSequence(filename, frameNumber);
     }
     if (sequence->IsSequenceRunning(filename)) {
+        double framePosition = frameNumber;
         if (secondsElapsed > 0.0001f) {
-            // recalculate the frame number based on the seconds
-            float step = sequence->GetSeqStepTime();
-            float newFrame = secondsElapsed * 1000.0f / step;
-            frameNumber = std::round(newFrame);
+            // recalculate the frame number based on the seconds, which carry
+            // remoteOffset: kept whole, the lights would move by the offset
+            // rounded to a frame (+30 ms at 20 fps moved them 50 ms).
+            framePosition = secondsElapsed * 1000.0 / sequence->GetSeqStepTime();
+            frameNumber = std::round(framePosition);
         }
-        UpdateMasterPosition(frameNumber);
+        UpdateMasterPosition(frameNumber, framePosition);
     }
 }
 
@@ -4268,7 +4346,7 @@ void MultiSync::ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stat
             LogErr(VB_SYNC, "Error: Invalid length of received sync packet\n");
             HexDump("Received data:", (void*)pkt, len, VB_SYNC);
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
 
@@ -4298,7 +4376,7 @@ void MultiSync::ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stat
             LogWarn(VB_SYNC, "Ignoring sync packets from %s for '%s': not a name in the media folders\n",
                     stats->sourceIP.c_str(), TruncateForLog(filename).c_str());
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
     // A NaN passes every "< 0" test and the int conversions downstream are
@@ -4320,15 +4398,15 @@ void MultiSync::ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stat
         switch (spkt->pktType) {
         case SYNC_PKT_OPEN:
             OpenSyncedSequence(filename);
-            stats->pktSyncSeqOpen++;
+            BumpStat(stats->pktSyncSeqOpen);
             break;
         case SYNC_PKT_START:
             StartSyncedSequence(filename);
-            stats->pktSyncSeqStart++;
+            BumpStat(stats->pktSyncSeqStart);
             break;
         case SYNC_PKT_STOP:
             StopSyncedSequence(filename);
-            stats->pktSyncSeqStop++;
+            BumpStat(stats->pktSyncSeqStop);
             break;
         case SYNC_PKT_SYNC:
             secondsElapsed = secondsIn - m_remoteOffset;
@@ -4337,14 +4415,14 @@ void MultiSync::ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stat
 
             SyncSyncedSequence(filename,
                                frameNumber, secondsElapsed);
-            stats->pktSyncSeqSync++;
+            BumpStat(stats->pktSyncSeqSync);
             break;
         }
     } else if (spkt->fileType == SYNC_FILE_MEDIA) {
         switch (spkt->pktType) {
         case SYNC_PKT_OPEN:
             OpenSyncedMedia(filename);
-            stats->pktSyncMedOpen++;
+            BumpStat(stats->pktSyncMedOpen);
             break;
         case SYNC_PKT_START:
             secondsElapsed = secondsIn - m_remoteOffset;
@@ -4352,11 +4430,11 @@ void MultiSync::ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stat
                 secondsElapsed = 0.0;
 
             StartSyncedMedia(filename, secondsElapsed);
-            stats->pktSyncMedStart++;
+            BumpStat(stats->pktSyncMedStart);
             break;
         case SYNC_PKT_STOP:
             StopSyncedMedia(filename);
-            stats->pktSyncMedStop++;
+            BumpStat(stats->pktSyncMedStop);
             break;
         case SYNC_PKT_SYNC:
             secondsElapsed = secondsIn - m_remoteOffset;
@@ -4365,7 +4443,7 @@ void MultiSync::ProcessSyncPacket(ControlPkt* pkt, int len, MultiSyncStats* stat
 
             SyncSyncedMedia(filename,
                             frameNumber, secondsElapsed);
-            stats->pktSyncMedSync++;
+            BumpStat(stats->pktSyncMedSync);
             break;
         }
     }
@@ -4382,11 +4460,11 @@ void MultiSync::ProcessCommandPacket(ControlPkt* pkt, int len, MultiSyncStats* s
             LogErr(VB_SYNC, "Error: Invalid length of received command packet\n");
             HexDump("Received data:", (void*)pkt, len, VB_SYNC);
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
 
-    stats->pktCommand++;
+    BumpStat(stats->pktCommand);
 
     CommandPkt* cpkt = (CommandPkt*)(((char*)pkt) + sizeof(ControlPkt));
 
@@ -4416,7 +4494,7 @@ void MultiSync::ProcessPingPacket(ControlPkt* pkt, int len, const std::string& s
             LogErr(VB_SYNC, "ERROR: Invalid length of received Ping packet\n");
             HexDump("Received data:", (void*)pkt, len, VB_SYNC);
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
 
@@ -4429,7 +4507,7 @@ void MultiSync::ProcessPingPacket(ControlPkt* pkt, int len, const std::string& s
             LogErr(VB_SYNC, "ERROR: Ping v1 packet too long: %d\n", pkt->extraDataLen);
             HexDump("Received data:", (void*)pkt, len, VB_SYNC);
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
     if ((pingVersion == 2) && (pkt->extraDataLen > 214)) {
@@ -4437,7 +4515,7 @@ void MultiSync::ProcessPingPacket(ControlPkt* pkt, int len, const std::string& s
             LogErr(VB_SYNC, "ERROR: Ping v2 packet too long %d\n", pkt->extraDataLen);
             HexDump("Received data:", (void*)pkt, len, VB_SYNC);
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
     int discover = extraData[1];
@@ -4551,7 +4629,7 @@ void MultiSync::ProcessPingPacket(ControlPkt* pkt, int len, const std::string& s
         }
     }
 
-    stats->pktPing++;
+    BumpStat(stats->pktPing);
 }
 
 void MultiSync::ProcessPluginPacket(ControlPkt* pkt, int plen, MultiSyncStats* stats) {
@@ -4569,7 +4647,7 @@ void MultiSync::ProcessPluginPacket(ControlPkt* pkt, int plen, MultiSyncStats* s
         if (ShouldLogBadPacket()) {
             LogErr(VB_SYNC, "Error: plugin packet name is not terminated within %d bytes of data\n", len);
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
     nlen++; // include the terminator
@@ -4581,7 +4659,7 @@ void MultiSync::ProcessPluginPacket(ControlPkt* pkt, int plen, MultiSyncStats* s
     }
     PluginManager::INSTANCE.multiSyncData(pn, data, len);
 
-    stats->pktPlugin++;
+    BumpStat(stats->pktPlugin);
 }
 
 static bool MyHostMatches(const std::string& host, const std::string& hostName, std::vector<MultiSyncSystem>& localSystems) {
@@ -4629,7 +4707,7 @@ void MultiSync::ProcessFPPCommandPacket(ControlPkt* pkt, int len, MultiSyncStats
         if (ShouldLogBadPacket()) {
             LogErr(VB_SYNC, "Error: truncated FPP Command packet\n");
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
     // Unsigned: as a signed char an argument count above 127 reads as negative
@@ -4642,7 +4720,7 @@ void MultiSync::ProcessFPPCommandPacket(ControlPkt* pkt, int len, MultiSyncStats
         if (ShouldLogBadPacket()) {
             LogErr(VB_SYNC, "Error: truncated FPP Command packet\n");
         }
-        stats->pktError++;
+        BumpStat(stats->pktError);
         return;
     }
 
@@ -4654,7 +4732,7 @@ void MultiSync::ProcessFPPCommandPacket(ControlPkt* pkt, int len, MultiSyncStats
                 LogErr(VB_SYNC, "Error: FPP Command packet claims %d arguments but only holds %d\n",
                        (int)numArgs, (int)args.size());
             }
-            stats->pktError++;
+            BumpStat(stats->pktError);
             return;
         }
         args.push_back(std::move(arg));
@@ -4673,7 +4751,7 @@ void MultiSync::ProcessFPPCommandPacket(ControlPkt* pkt, int len, MultiSyncStats
         matches = MyHostMatches(host, m_hostname, localSystems);
     }
     if (matches) {
-        stats->pktFPPCommand++;
+        BumpStat(stats->pktFPPCommand);
         // Remote-supplied and unbounded - truncate. (The args are covered by
         // CommandManager::run()'s own log line below.)
         LogDebug(VB_COMMAND, "Command \"%s\" received from remote host %s (%s)\n",
@@ -4763,8 +4841,8 @@ void MultiSync::SendFPPCommandPacket(const std::string& host, const std::string&
                TruncateForLog(cmd).c_str(), (int)payloadLen);
     } else {
         SendControlPacket(outBuf, pos);
-        // the packet won't loop back so if it's supposed to run on this host as well,
-        // we need to force it
+        // Run it here directly: multicast and unicast don't loop back, and the
+        // broadcast copies that do are dropped as our own (IsOwnEcho).
         if (host == "" || MyHostMatches(host, m_hostname, localSystems)) {
             LogDebug(VB_COMMAND, "Command \"%s\" broadcast includes this host, running locally too\n", cmd.c_str());
             CommandManager::INSTANCE.run(cmd, args);
@@ -4807,20 +4885,20 @@ Json::Value MultiSyncStats::toJSON() {
              tm.tm_hour, tm.tm_min, tm.tm_sec);
 
     result["lastReceiveTime"] = timeStr;
-    result["pktCommand"] = pktCommand;
-    result["pktSyncSeqOpen"] = pktSyncSeqOpen;
-    result["pktSyncSeqStart"] = pktSyncSeqStart;
-    result["pktSyncSeqStop"] = pktSyncSeqStop;
-    result["pktSyncSeqSync"] = pktSyncSeqSync;
-    result["pktSyncMedOpen"] = pktSyncMedOpen;
-    result["pktSyncMedStart"] = pktSyncMedStart;
-    result["pktSyncMedStop"] = pktSyncMedStop;
-    result["pktSyncMedSync"] = pktSyncMedSync;
-    result["pktBlank"] = pktBlank;
-    result["pktPing"] = pktPing;
-    result["pktPlugin"] = pktPlugin;
-    result["pktFPPCommand"] = pktFPPCommand;
-    result["pktError"] = pktError;
+    result["pktCommand"] = __atomic_load_n(&pktCommand, __ATOMIC_RELAXED);
+    result["pktSyncSeqOpen"] = __atomic_load_n(&pktSyncSeqOpen, __ATOMIC_RELAXED);
+    result["pktSyncSeqStart"] = __atomic_load_n(&pktSyncSeqStart, __ATOMIC_RELAXED);
+    result["pktSyncSeqStop"] = __atomic_load_n(&pktSyncSeqStop, __ATOMIC_RELAXED);
+    result["pktSyncSeqSync"] = __atomic_load_n(&pktSyncSeqSync, __ATOMIC_RELAXED);
+    result["pktSyncMedOpen"] = __atomic_load_n(&pktSyncMedOpen, __ATOMIC_RELAXED);
+    result["pktSyncMedStart"] = __atomic_load_n(&pktSyncMedStart, __ATOMIC_RELAXED);
+    result["pktSyncMedStop"] = __atomic_load_n(&pktSyncMedStop, __ATOMIC_RELAXED);
+    result["pktSyncMedSync"] = __atomic_load_n(&pktSyncMedSync, __ATOMIC_RELAXED);
+    result["pktBlank"] = __atomic_load_n(&pktBlank, __ATOMIC_RELAXED);
+    result["pktPing"] = __atomic_load_n(&pktPing, __ATOMIC_RELAXED);
+    result["pktPlugin"] = __atomic_load_n(&pktPlugin, __ATOMIC_RELAXED);
+    result["pktFPPCommand"] = __atomic_load_n(&pktFPPCommand, __ATOMIC_RELAXED);
+    result["pktError"] = __atomic_load_n(&pktError, __ATOMIC_RELAXED);
 
     return result;
 }

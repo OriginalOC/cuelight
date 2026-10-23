@@ -13,6 +13,8 @@
 #include "fpp-pch.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstring>
 #include <list>
 #include <memory>
@@ -22,6 +24,7 @@
 #include <vector>
 
 #include "CurlManager.h"
+#include "CurlSocket.h"
 #include "fppversion.h"
 #include "log.h"
 
@@ -118,22 +121,60 @@ void CurlManager::addCURL(const std::string& furl, CURL* curl, std::function<voi
     curls.push_back(i);
 }
 
-// Every response here is an API reply or a web page, held whole in memory.
-// Discovery probes devices that are merely on the LAN, and one that streams an
-// endless body would otherwise grow fppd until the OOM killer stepped in (the
-// timeout alone allows ~100MB at LAN speed).  Returning short aborts the
-// transfer with CURLE_WRITE_ERROR, which callers already treat as a failure.
-static constexpr size_t MAX_CURL_RESPONSE = 16 * 1024 * 1024;
-
 static size_t urlWriteData(void* buffer, size_t size, size_t nmemb, void* userp) {
     std::vector<uint8_t>* str = (std::vector<uint8_t>*)userp;
-    if (size * nmemb > MAX_CURL_RESPONSE - std::min(str->size(), MAX_CURL_RESPONSE)) {
-        return 0;
-    }
     size_t pos = str->size();
     str->resize(str->size() + size * nmemb);
     memcpy(&str->data()[pos], buffer, size * nmemb);
     return size * nmemb;
+}
+
+// The requests FPP makes itself (add*(), do*()) and its discovery probes hold
+// the whole response in memory, and discovery reaches devices that are merely
+// on the LAN: one that streamed an endless body grew fppd until the OOM killer
+// stepped in (the timeout alone allows ~100MB at LAN speed).  Returning short
+// aborts the transfer with CURLE_WRITE_ERROR -- but the HTTP status already
+// received still reads 200, so the request paths below report that result,
+// like any other failed transfer, as a failure themselves (failedTransfer()).
+// A plugin's own handle from createCurl() keeps no
+// limit: it reads the status and the body itself, and a cut-off body with a
+// 200 is what its proxy then served (limitResponseSize() opts a handle in).
+static constexpr size_t MAX_CURL_RESPONSE = 16 * 1024 * 1024;
+
+static size_t urlWriteDataLimited(void* buffer, size_t size, size_t nmemb, void* userp) {
+    std::vector<uint8_t>* str = (std::vector<uint8_t>*)userp;
+    if (size * nmemb > MAX_CURL_RESPONSE - std::min(str->size(), MAX_CURL_RESPONSE)) {
+        return 0;
+    }
+    return urlWriteData(buffer, size, nmemb, userp);
+}
+
+void CurlManager::limitResponseSize(CURL* c) {
+    curl_easy_setopt(c, CURLOPT_WRITEFUNCTION, urlWriteDataLimited);
+}
+
+// The result of the transfer whose callback is running on this thread, set by
+// doProcessCurls() around it: the callbacks take only the handle, and the
+// result isn't one of its infos.
+static thread_local CURLcode t_completedResult = CURLE_OK;
+
+// Why a transfer failed, or "" if it completed.  CURLINFO_RESPONSE_CODE is
+// the last status received even when the transfer then failed: a body cut
+// off by the size cap, a timeout or a reset partway through, or a server
+// that closed before its Content-Length all read as a 200 with part of the
+// body.  So the requests below go by the transfer's result, not the status.
+static std::string failedTransfer(CURLcode result, const CurlManager::CurlPrivateData* data) {
+    if (result == CURLE_OK) {
+        return "";
+    }
+    if (result == CURLE_WRITE_ERROR) {
+        // only urlWriteDataLimited() returns short on these handles
+        return "the response was larger than " + std::to_string(MAX_CURL_RESPONSE / (1024 * 1024)) + " MB";
+    }
+    if (data && data->errorResp[0]) {
+        return data->errorResp;
+    }
+    return curl_easy_strerror(result);
 }
 static size_t urlReadData(void* ptr, size_t size, size_t nmemb, void* userp) {
     size_t buffer_size = size * nmemb;
@@ -164,6 +205,7 @@ CURL* CurlManager::createCurl(const std::string& fullUrl, CurlPrivateData** cpd,
         password = hd->password;
     }
     CURL* c = curl_easy_init();
+    SetCurlCloseOnExec(c);
     curl_easy_setopt(c, CURLOPT_URL, fullUrl.c_str());
     if (share) {
         // Join the cookie session: arm the cookie engine (empty COOKIEFILE) and
@@ -207,6 +249,7 @@ void CurlManager::add(const std::string& furl, const std::string& method, const 
                       const std::string& owner, const std::string& cookieSession) {
     CURLSH* share = cookieSession.empty() ? nullptr : getCookieShare(cookieSession);
     CURL* curl = createCurl(furl, nullptr, false, share);
+    limitResponseSize(curl);
 
     if (method == "POST") {
         curl_easy_setopt(curl, CURLOPT_POST, 1);
@@ -243,8 +286,13 @@ void CurlManager::add(const std::string& furl, const std::string& method, const 
 
     addCURL(furl, curl, [callback, headerList](CURL* c) {
         CurlPrivateData* data = nullptr;
-        long rc = 0;
         curl_easy_getinfo(c, CURLINFO_PRIVATE, &data);
+        std::string failure = failedTransfer(t_completedResult, data);
+        if (!failure.empty()) {
+            callback(0, failure);
+            return;
+        }
+        long rc = 0;
         curl_easy_getinfo(c, CURLINFO_RESPONSE_CODE, &rc);
 
         char* urlp = nullptr;
@@ -301,27 +349,48 @@ int CurlManager::cancelRequests(const std::string& owner) {
     return (int)doomed.size();
 }
 
+// Runs one synchronous request to completion.  The main loop pumps curl
+// too, and when it completes this request it drops numCurls before calling
+// the callback: processCurls() here then returned false with `done` still
+// unset, this frame returned, and the callback wrote `done` into it.  The
+// flag is shared instead, and the wait is for this request only (doPut
+// waited for every request in flight).
+// Returns the transfer's result.
+static CURLcode runToCompletion(CurlManager& mgr, const std::string& furl, CURL* curl) {
+    struct State {
+        std::atomic<bool> done{ false };
+        CURLcode result = CURLE_OK; // written before done, read after
+    };
+    auto state = std::make_shared<State>();
+    mgr.addCURL(
+        furl, curl, [state](CURL* c) { state->result = t_completedResult; state->done = true; }, false);
+    while (!state->done) {
+        if (!mgr.processCurls()) {
+            // another thread holds it between completion and the callback
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        } else {
+            std::this_thread::yield();
+        }
+    }
+    return state->result;
+}
+
 std::string CurlManager::doGet(const std::string& furl, int& rc, const std::string& cookieSession) {
     CURLSH* share = cookieSession.empty() ? nullptr : getCookieShare(cookieSession);
     CURL* curl = createCurl(furl, nullptr, false, share);
+    limitResponseSize(curl);
 
-    bool done = false;
-    addCURL(
-        furl, curl, [&done](CURL* c) { done = true; }, false);
-    while (!done && processCurls()) {
-        std::this_thread::yield();
-    }
+    CURLcode result = runToCompletion(*this, furl, curl);
 
     CurlPrivateData* data = nullptr;
     long rc2 = 0;
     curl_easy_getinfo(curl, CURLINFO_PRIVATE, &data);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &rc2);
-    rc = rc2;
-    std::string resp;
-    if (rc) {
+    // On a failed transfer, rc 0 and the reason, as for one that never connected.
+    std::string resp = failedTransfer(result, data);
+    rc = resp.empty() ? rc2 : 0;
+    if (resp.empty()) {
         resp.assign(reinterpret_cast<char*>(data->resp.data()), data->resp.size());
-    } else {
-        resp = data->errorResp;
     }
     delete data;
     curl_easy_cleanup(curl);
@@ -346,6 +415,7 @@ static size_t read_callback(void* ptr, size_t size, size_t nmemb, void* userp) {
 }
 std::string CurlManager::doPost(const std::string& furl, const std::string& contentType, const std::vector<uint8_t>& data, int& rc) {
     CURL* curl = createCurl(furl);
+    limitResponseSize(curl);
 
     struct curl_slist* head = nullptr;
     std::string ct = "Content-Type: " + contentType;
@@ -364,23 +434,17 @@ std::string CurlManager::doPost(const std::string& furl, const std::string& cont
     curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)data.size());
 
-    bool done = false;
-    addCURL(
-        furl, curl, [&done](CURL* c) { done = true; }, false);
-    while (!done && processCurls()) {
-        std::this_thread::yield();
-    }
+    CURLcode result = runToCompletion(*this, furl, curl);
 
     CurlPrivateData* cdata = nullptr;
     long rc2 = 0;
     curl_easy_getinfo(curl, CURLINFO_PRIVATE, &cdata);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &rc2);
-    rc = rc2;
-    std::string resp;
-    if (rc) {
+    // On a failed transfer, rc 0 and the reason, as for one that never connected.
+    std::string resp = failedTransfer(result, cdata);
+    rc = resp.empty() ? rc2 : 0;
+    if (resp.empty()) {
         resp.assign(reinterpret_cast<char*>(cdata->resp.data()), cdata->resp.size());
-    } else {
-        resp = cdata->errorResp;
     }
     delete cdata;
     curl_slist_free_all(head);
@@ -389,6 +453,7 @@ std::string CurlManager::doPost(const std::string& furl, const std::string& cont
 }
 std::string CurlManager::doPut(const std::string& furl, const std::string& contentType, const std::vector<uint8_t>& data, int& rc) {
     CURL* curl = createCurl(furl);
+    limitResponseSize(curl);
 
     struct curl_slist* head = nullptr;
     std::string ct = "Content-Type: " + contentType;
@@ -408,22 +473,17 @@ std::string CurlManager::doPut(const std::string& furl, const std::string& conte
     curl_easy_setopt(curl, CURLOPT_READFUNCTION, read_callback);
     curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)data.size());
 
-    addCURL(
-        furl, curl, [](CURL* c) {}, false);
-    while (processCurls()) {
-        std::this_thread::yield();
-    }
+    CURLcode result = runToCompletion(*this, furl, curl);
 
     CurlPrivateData* cdata = nullptr;
     long rc2 = 0;
     curl_easy_getinfo(curl, CURLINFO_PRIVATE, &cdata);
     curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &rc2);
-    rc = rc2;
-    std::string resp;
-    if (rc) {
+    // On a failed transfer, rc 0 and the reason, as for one that never connected.
+    std::string resp = failedTransfer(result, cdata);
+    rc = resp.empty() ? rc2 : 0;
+    if (resp.empty()) {
         resp.assign(reinterpret_cast<char*>(cdata->resp.data()), cdata->resp.size());
-    } else {
-        resp = cdata->errorResp;
     }
     delete cdata;
     curl_slist_free_all(head);
@@ -443,6 +503,8 @@ bool CurlManager::doProcessCurls() {
             m = curl_multi_info_read(curlMulti, &msgq);
             if (m && (m->msg == CURLMSG_DONE)) {
                 CURL* e = m->easy_handle;
+                // m is invalid once the handle is removed
+                CURLcode result = m->data.result;
                 curl_multi_remove_handle(curlMulti, e);
                 CurlInfo* ci = nullptr;
                 for (int x = 0; x < curls.size(); x++) {
@@ -455,6 +517,7 @@ bool CurlManager::doProcessCurls() {
                 }
                 if (ci) {
                     l.unlock();
+                    t_completedResult = result;
                     // The callbacks parse what a remote or a probed device sent
                     // back, on the main loop with nothing above to catch: one
                     // jsoncpp throw on a field of the wrong type ({"Platform":{}}
@@ -473,6 +536,7 @@ bool CurlManager::doProcessCurls() {
                         curl_easy_getinfo(e, CURLINFO_EFFECTIVE_URL, &url);
                         LogWarn(VB_GENERAL, "Ignoring the reply from %s: handling it failed\n", url ? url : "(unknown)");
                     }
+                    t_completedResult = CURLE_OK;
                     l.lock();
                     if (ci->cleanCurl) {
                         CurlPrivateData* data = nullptr;

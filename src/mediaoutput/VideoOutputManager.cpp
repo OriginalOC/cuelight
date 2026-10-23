@@ -43,6 +43,7 @@
 #endif
 
 #include "fpp-json.h"
+#include "../SysSocket.h"
 
 // SAP (Session Announcement Protocol) constants — RFC 2974
 static constexpr const char* SAP_MCAST_ADDR = "239.255.255.255";
@@ -399,11 +400,17 @@ void VideoOutputManager::Shutdown() {
         warmWorker.join();
     }
 
-    std::lock_guard<std::mutex> lock(m_mutex);
-    StopAllConsumers();
-    m_consumers.clear();
-    m_activeProducer.clear();
-    m_initialized = false;
+    {
+        std::lock_guard<std::mutex> lock(m_mutex);
+        StopAllConsumers();
+        m_consumers.clear();
+        m_activeProducer.clear();
+        m_initialized = false;
+    }
+    // The teardown threads StopAllConsumers() started use this object's
+    // teardown mutex and condition variable; at exit this object is destroyed
+    // next, under them.  Bounded: a wedged teardown must not hang shutdown.
+    WaitForPendingTeardowns(5000);
     LogInfo(VB_MEDIAOUT, "VideoOutputManager: Shutdown complete\n");
 }
 
@@ -528,6 +535,11 @@ void VideoOutputManager::ReleaseConnectorFromMedia(int connectorId) {
         m_mediaConnectors.erase(it);
         for (auto& c : m_consumers) {
             if (c.suspendedForMedia && c.connectorId == connectorId) {
+                // No media holds the connector now.  Cleared here, not on a
+                // successful start: a comeback that fails (display off, a
+                // pipeline that won't build) must leave it to the ordinary
+                // retry, which skips a consumer still standing aside.
+                c.suspendedForMedia = false;
                 channels.insert(c.sourceNode);
             }
         }
@@ -893,11 +905,15 @@ void VideoOutputManager::ParkConsumer(ConsumerInfo& consumer, uint64_t holdUntil
         GstElement* p = GST_ELEMENT(gst_object_ref(consumer.pipeline));
         std::shared_ptr<std::atomic<bool>> playing = consumer.playing;
         std::shared_ptr<std::mutex> stateLock = consumer.stateLock;
+        std::shared_ptr<std::atomic<bool>> stopping = consumer.shutdownRequested;
         playing->store(false);
-        std::thread([p, playing, stateLock]() {
+        std::thread([p, playing, stateLock, stopping]() {
             {
+                // Not once StopConsumer() has begun tearing this run down:
+                // running after its NULL, PAUSED brought the pipeline back
+                // up -- kmssink and all -- after its DRM lease was returned.
                 std::lock_guard<std::mutex> sl(*stateLock);
-                if (!playing->load()) {
+                if (!playing->load() && !stopping->load()) {
                     gst_element_set_state(p, GST_STATE_PAUSED);
                 }
             }
@@ -1055,61 +1071,72 @@ bool VideoOutputManager::LoadConfig() {
 
     for (const auto& entry : root) {
         ConsumerInfo ci;
-        ci.id = entry.get("id", 0).asInt();
-        ci.name = entry.get("name", "").asString();
-        ci.type = entry.get("type", "").asString();
-        ci.pipeWireNodeName = entry.get("pipeWireNodeName", "").asString();
-
-        if (ci.type == "hdmi") {
-            ci.connector = entry.get("connector", "").asString();
-            ci.cardPath = entry.get("cardPath", "").asString();
-            ci.connectorId = entry.get("connectorId", -1).asInt();
-            ci.width = entry.get("width", 0).asInt();
-            ci.height = entry.get("height", 0).asInt();
-            ci.scaling = entry.get("scaling", "fit").asString();
-            // Anything else would silently land in the "not stretch, not fill"
-            // bucket and look like fit without saying so.
-            if (ci.scaling != "fit" && ci.scaling != "fill" && ci.scaling != "stretch") {
-                LogWarn(VB_MEDIAOUT, "VideoOutputManager: consumer '%s' has unknown scaling "
-                        "mode '%s' — using fit\n", ci.name.c_str(), ci.scaling.c_str());
-                ci.scaling = "fit";
+        // asInt()/asString() throw on a value of the wrong type, and this
+        // runs at startup with nothing above to catch it; skip that consumer.
+        try {
+            if (!entry.isObject()) {
+                continue;
             }
-            // Optional sub-region of the source, as fractions of the frame.
-            // Absent (the common case) leaves the full-frame default.
-            if (entry.isMember("crop") && entry["crop"].isObject()) {
-                const Json::Value& c = entry["crop"];
-                ci.crop.x = c.get("x", 0.0).asDouble();
-                ci.crop.y = c.get("y", 0.0).asDouble();
-                ci.crop.width = c.get("width", 1.0).asDouble();
-                ci.crop.height = c.get("height", 1.0).asDouble();
-                if (!ci.crop.IsValid()) {
-                    LogWarn(VB_MEDIAOUT, "VideoOutputManager: consumer '%s' has an out-of-range "
-                            "crop region (%.3f,%.3f %.3fx%.3f) — using the full frame\n",
-                            ci.name.c_str(), ci.crop.x, ci.crop.y, ci.crop.width, ci.crop.height);
-                    ci.crop = VideoCropRect();
+            ci.id = entry.get("id", 0).asInt();
+            ci.name = entry.get("name", "").asString();
+            ci.type = entry.get("type", "").asString();
+            ci.pipeWireNodeName = entry.get("pipeWireNodeName", "").asString();
+
+            if (ci.type == "hdmi") {
+                ci.connector = entry.get("connector", "").asString();
+                ci.cardPath = entry.get("cardPath", "").asString();
+                ci.connectorId = entry.get("connectorId", -1).asInt();
+                ci.width = entry.get("width", 0).asInt();
+                ci.height = entry.get("height", 0).asInt();
+                ci.scaling = entry.get("scaling", "fit").asString();
+                // Anything else would silently land in the "not stretch, not fill"
+                // bucket and look like fit without saying so.
+                if (ci.scaling != "fit" && ci.scaling != "fill" && ci.scaling != "stretch") {
+                    LogWarn(VB_MEDIAOUT, "VideoOutputManager: consumer '%s' has unknown scaling "
+                            "mode '%s' — using fit\n", ci.name.c_str(), ci.scaling.c_str());
+                    ci.scaling = "fit";
+                }
+                // Optional sub-region of the source, as fractions of the frame.
+                // Absent (the common case) leaves the full-frame default.
+                if (entry.isMember("crop") && entry["crop"].isObject()) {
+                    const Json::Value& c = entry["crop"];
+                    ci.crop.x = c.get("x", 0.0).asDouble();
+                    ci.crop.y = c.get("y", 0.0).asDouble();
+                    ci.crop.width = c.get("width", 1.0).asDouble();
+                    ci.crop.height = c.get("height", 1.0).asDouble();
+                    if (!ci.crop.IsValid()) {
+                        LogWarn(VB_MEDIAOUT, "VideoOutputManager: consumer '%s' has an out-of-range "
+                                "crop region (%.3f,%.3f %.3fx%.3f) — using the full frame\n",
+                                ci.name.c_str(), ci.crop.x, ci.crop.y, ci.crop.width, ci.crop.height);
+                        ci.crop = VideoCropRect();
+                    }
+                }
+            } else if (ci.type == "overlay") {
+                ci.overlayModel = entry.get("overlayModel", "").asString();
+            } else if (ci.type == "rtp") {
+                ci.address = entry.get("address", "239.0.0.1").asString();
+                ci.port = entry.get("port", 5004).asInt();
+                ci.rtpEncoding = entry.get("encoding", "raw").asString();
+            }
+
+            if (ci.type.empty() || ci.pipeWireNodeName.empty()) {
+                LogWarn(VB_MEDIAOUT, "VideoOutputManager: Skipping consumer with missing type or node name\n");
+                continue;
+            }
+
+            ci.sourceNode = entry.get("sourceNode", "").asString();
+
+            if (entry.isMember("streamSlots") && entry["streamSlots"].isArray()) {
+                for (const auto& s : entry["streamSlots"]) {
+                    int slot = s.asInt();
+                    if (slot >= 1 && slot <= 5)
+                        ci.streamSlots.push_back(slot);
                 }
             }
-        } else if (ci.type == "overlay") {
-            ci.overlayModel = entry.get("overlayModel", "").asString();
-        } else if (ci.type == "rtp") {
-            ci.address = entry.get("address", "239.0.0.1").asString();
-            ci.port = entry.get("port", 5004).asInt();
-            ci.rtpEncoding = entry.get("encoding", "raw").asString();
-        }
-
-        if (ci.type.empty() || ci.pipeWireNodeName.empty()) {
-            LogWarn(VB_MEDIAOUT, "VideoOutputManager: Skipping consumer with missing type or node name\n");
+        } catch (const std::exception& ex) {
+            LogWarn(VB_MEDIAOUT, "VideoOutputManager: skipping a consumer in %s, a value has the wrong type: %s\n",
+                    configPath.c_str(), ex.what());
             continue;
-        }
-
-        ci.sourceNode = entry.get("sourceNode", "").asString();
-
-        if (entry.isMember("streamSlots") && entry["streamSlots"].isArray()) {
-            for (const auto& s : entry["streamSlots"]) {
-                int slot = s.asInt();
-                if (slot >= 1 && slot <= 5)
-                    ci.streamSlots.push_back(slot);
-            }
         }
 
         // Both go into a gst_parse_launch() description unquoted; a space or
@@ -1578,9 +1605,16 @@ bool VideoOutputManager::StartConsumer(ConsumerInfo& consumer, const std::string
 
         // kmssink sync=true paces frame rendering by intervideosrc timestamps
         // (fresh monotonic timestamps, independent of HLS timing).
+        // skip-vsync=true, as on every other kmssink here: without it kmssink
+        // waits for its page-flip event with drmHandleEvent() on its fd. When
+        // DrmCards::AcquireLease() can't lease the connector (a restart while
+        // the old consumer still holds it), that fd is the card's shared one,
+        // whose events the framebuffer outputs drain: kmssink then stalled 3 s
+        // on an event they took, or ran its handler on one of theirs, whose
+        // user data is a flip token, not its pointer (SIGSEGV).
         pipelineDesc += "kmssink name=sink sync=true"
                      " connector-id=" + std::to_string(consumer.connectorId)
-                     + " restore-crtc=true";
+                     + " restore-crtc=true skip-vsync=true";
 
     } else if (consumer.type == "overlay") {
         // Resolve the pixel overlay model to get its dimensions
@@ -2102,13 +2136,20 @@ void VideoOutputManager::StopConsumer(ConsumerInfo& consumer) {
         // consumer -- neither may happen while the kmssink is alive.
         DrmCards::Lease lease = consumer.drmLease;
         consumer.drmLease = DrmCards::Lease();
+        // A restart may ask for the connector before this thread is done.
+        DrmCards::RetireLease(lease);
         {
             std::lock_guard<std::mutex> tl(m_teardownMutex);
             m_pendingTeardowns++;
         }
-        std::thread([this, p, lease]() mutable {
+        std::shared_ptr<std::mutex> stateLock = consumer.stateLock;
+        std::thread([this, p, lease, stateLock]() mutable {
             uint64_t startMs = GetTimeMS();
-            gst_element_set_state(p, GST_STATE_NULL);
+            {
+                // after any park's PAUSED already under way; see ParkConsumer()
+                std::lock_guard<std::mutex> sl(*stateLock);
+                gst_element_set_state(p, GST_STATE_NULL);
+            }
             gst_object_unref(p);
             DrmCards::ReleaseLease(lease);
             {
@@ -2330,7 +2371,7 @@ void VideoOutputManager::StopSAPAnnouncer() {
 void VideoOutputManager::SAPAnnounceLoop() {
     LogInfo(VB_MEDIAOUT, "VideoOutputManager SAP announcer thread started\n");
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         LogErr(VB_MEDIAOUT, "VideoOutputManager SAP: Failed to create socket: %s\n", FPPstrerror(errno));
         return;

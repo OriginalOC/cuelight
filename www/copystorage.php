@@ -65,10 +65,20 @@ $remote_storage = (isset($_GET['remoteStorage']) && is_string($_GET['remoteStora
 $flagWords = preg_split('/\s+/', $getStr('flags'), -1, PREG_SPLIT_NO_EMPTY);
 $flagsEscaped = implode(' ', array_map('escapeshellarg', (array)$flagWords));
 
-$tee_log_file = $logDirectory . "/fpp_backup_filecopy.log";
-//Remove the log file if it exists before we start
-if (file_exists($tee_log_file)) {
-    unlink($tee_log_file);
+// Each run has its own progress feed, so overlapping runs can't delete or mix
+// each other's. The id comes from the dialog that polls it, else is random.
+$feedId = $getStr('feed');
+if (!preg_match('/^[A-Za-z0-9]{1,32}$/', $feedId)) {
+    $feedId = bin2hex(random_bytes(6));
+}
+$tee_log_file = $logDirectory . "/fpp_backup_filecopy_" . $feedId . ".log";
+// Feeds left by runs that were killed before they could remove theirs (and the
+// old shared fpp_backup_filecopy.log). A day old can't be a live run's.
+foreach (glob($logDirectory . "/fpp_backup_filecopy*.log") as $oldFeed) {
+    $mtime = @filemtime($oldFeed); // another run may remove its feed meanwhile
+    if ($mtime !== false && $mtime < time() - 86400) {
+        @unlink($oldFeed);
+    }
 }
 
 $output_header_start = "==================================================================================\n";
@@ -79,7 +89,7 @@ $command = "sudo stdbuf --output=L " . __DIR__ . "/../scripts/copy_settings_to_s
 
 // Breadcrumb the backup into the fppd.log timeline, like every other operation.
 //
-// fpp_backup_filecopy.log has to keep its name and location for the duration of
+// The feed file has to keep its name and location for the duration of
 // the run: it is not a log but a live progress FEED, polled once a second by
 // backup.php (api/file/Logs/...) -- the ONE file under logs/ with a live reader.
 // It only needs to exist FOR the run though, so the tail of this script writes
@@ -87,7 +97,7 @@ $command = "sudo stdbuf --output=L " . __DIR__ . "/../scripts/copy_settings_to_s
 // file disappearing to detect completion (see CopyTimeoutError: "we rely on logs
 // api returning a file not found error to signify the copy process ending").
 $backupTarget = escapeshellcmd($direction) . ' ' . escapeshellcmd($getStr('storageLocation'));
-FppdLogLine('copystorage.php', 'Backup', 'backup START: ' . $backupTarget . ' (detail: logs/fpp_backup_filecopy.log, live)');
+FppdLogLine('copystorage.php', 'Backup', 'backup START: ' . $backupTarget . ' (detail: logs/' . basename($tee_log_file) . ', live)');
 
 $output_command = "Command: " . htmlspecialchars($command) . "\n";
 echo $output_command;
@@ -135,23 +145,22 @@ $hasEeprom = stripos($flags, 'EEPROM') !== false;
 // Both markers require a full reboot, not just an fppd restart (fppinit
 // start/postNetwork don't run on an fppd-only restart).
 //
-// Not gated on $backupRc === 0: system()'s pipe here ("... | tee -a
-// $tee_log_file") runs via /bin/sh without pipefail, so $backupRc is tee's
-// exit code, not copy_settings_to_storage.sh's -- it's ~always 0 regardless
-// of whether the actual copy succeeded, so it was never a real success
-// check. A partial/failed copy still needs whatever DID land reconciled,
-// same reasoning as backup.php's $restore_done-only gate.
+// Not gated on $backupRc === 0: a partial/failed copy still needs whatever
+// DID land reconciled, same reasoning as backup.php's $restore_done-only gate.
+// The one exception is rc 90 (RC_REMOTE_MOUNT_FAILED in the script), returned
+// when the remote host couldn't mount its device and nothing was copied.
 //
 // /fpp_restored, not the reflash's /fppos_upgraded (see backup.php).  The
 // plugins themselves were installed on another box, so their fpp_install.sh
 // never ran here and any native ones were built there: ask for a reinstall,
 // as a reflash does.
-if ($isRestore && ($hasConfig || $hasPlugins || $hasEeprom)) {
+$nothingCopied = ($backupRc == 90);
+if ($isRestore && !$nothingCopied && ($hasConfig || $hasPlugins || $hasEeprom)) {
     WriteSettingToFile('rebootFlag', '1');
     WriteSettingToFile('BootActions', 'settings');
     exec('sudo touch /fpp_restored');
 }
-if ($isRestore && $hasPlugins) {
+if ($isRestore && !$nothingCopied && $hasPlugins) {
     WriteSettingToFile('pluginReinstallNeededAfterOS', '1');
 }
 
@@ -160,7 +169,7 @@ if ($isRestore && $hasPlugins) {
 // ends; "Plugins" brings in plugins outside the Plugin Manager, and
 // "Configuration" replaces the settings file (plugin source flags included).
 $copiedModes = array_values(array_intersect(array('All', 'Configuration', 'Plugins'), (array) $flagWords));
-if ($isRestore && !empty($copiedModes)) {
+if ($isRestore && !$nothingCopied && !empty($copiedModes)) {
     require_once __DIR__ . '/common/pluginhistory.inc.php';
     AppendPluginHistory('', 'copied', array('modes' => $copiedModes, 'direction' => $direction));
 }
@@ -168,9 +177,9 @@ if ($isRestore && !empty($copiedModes)) {
 // The run's output goes into the fppd.log timeline, and the progress file is
 // then removed rather than kept as fpp_backup_filecopy_last.log.
 //
-// fpp_backup_filecopy.log is a live progress FEED, not a log: it is deleted at
-// the start of every run and polled once a second by backup.php while the copy
-// runs (api/file/Logs/...), which is why it has to keep its name and location.
+// fpp_backup_filecopy_<feed>.log is a live progress FEED, not a log: it is
+// polled once a second by backup.php while the copy runs (api/file/Logs/...),
+// which is why it has to keep its name and location until the run ends.
 // But it only ever needed to exist FOR the run. Renaming it to _last.log left a
 // permanent file in logs/ holding exactly one backup -- the previous one was
 // overwritten every time -- so it was simultaneously clutter AND a bad archive.

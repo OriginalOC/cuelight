@@ -162,25 +162,31 @@ PixelOverlayModelSub::~PixelOverlayModelSub() {
 // doOverlay() from PixelOverlayManager::doOverlays() with activeModelsLock
 // already held, and every HTTP handler takes modelsLock before
 // activeModelsLock (via setState() -> modelStateChanged()), so a lookup from
-// that side would invert them. setState() below is the only caller, and the
-// resolution itself uses tryGetModel(): setState() can also run on the effect
-// update threads (an effect stopping calls model->setState() under this
-// model's effectLock), where BLOCKING on modelsLock is the reverse of the
+// that side would invert them. Callers are setState() below and
+// readyForPolarJoin() (effect start), and the resolution itself only
+// try-locks modelsLock: setState() can also run on the effect update threads
+// (an effect stopping calls model->setState() under this model's
+// effectLock), where BLOCKING on modelsLock is the reverse of the
 // HTTP/command paths' modelsLock -> effectLock order and deadlocks outright --
 // the same shape 37c8f92a8 fixed one lock over. The try-acquire never blocks:
 // from the manager paths (which already hold modelsLock recursively) it always
 // succeeds, and a contended effect-side resolve just stays unresolved until
 // the next setState().
 bool PixelOverlayModelSub::foundParent() {
-    if (parent)
-        return true;
+    {
+        std::lock_guard<std::mutex> l(parentLock);
+        if (parent)
+            return true;
+    }
 
-    PixelOverlayModel* p = nullptr;
-    if (!PixelOverlayManager::INSTANCE.tryGetModel(config["Parent"].asString(), p)) {
+    PixelOverlayManager& mgr = PixelOverlayManager::INSTANCE;
+    std::unique_lock<std::recursive_mutex> lock(mgr.modelsLock, std::try_to_lock);
+    if (!lock.owns_lock()) {
         // modelsLock contended and not ours; do not log -- the parent may be
         // perfectly valid, we just can't look it up without risking deadlock.
         return false;
     }
+    PixelOverlayModel* p = mgr.getModelLocked(config["Parent"].asString());
 
     // Refuse a parent chain that leads back here: a submodel naming itself
     // (the Parent picker lists every model, this one included) or a loop of
@@ -200,15 +206,15 @@ bool PixelOverlayModelSub::foundParent() {
         if (!s || s->gridMode) {
             break;
         }
-        PixelOverlayModel* next = nullptr;
-        if (!PixelOverlayManager::INSTANCE.tryGetModel(s->config["Parent"].asString(), next)) {
-            return false;
-        }
-        a = next;
+        a = mgr.getModelLocked(s->config["Parent"].asString());
     }
-    parent = p;
 
-    if (parent) {
+    if (p) {
+        // Under modelsLock, so a reload can't retire it (and resetParent()
+        // this model) between the lookup and here.
+        std::lock_guard<std::mutex> l(parentLock);
+        parent = p;
+        parentRef = mgr.models[p->getName()].owner;
         return true;
     }
 
@@ -229,15 +235,29 @@ void PixelOverlayModelSub::setState(const PixelOverlayState& st) {
     // active list. From the moment it lands there the channel output thread can
     // call doOverlay() on it, and resolving from that side takes modelsLock
     // while doOverlays() holds activeModelsLock -- the inversion described on
-    // foundParent(). Doing it here is free: setState() already runs under
-    // modelsLock on every path that reaches it, so this is a recursive
-    // re-acquire rather than a new one.
-    bool haveParent = foundParent();
+    // foundParent(). Doing it here is free: setState() runs under modelsLock
+    // on the manager's paths, so this is a recursive re-acquire there.
+    //
+    // Not every path holds modelsLock, though: an effect that disables its
+    // model when it finishes (Stop Effects, Text/Image with disableWhenDone,
+    // WLED autoDisable) gets here from the effect or output thread, while an
+    // output reload's removeAutoOverlayModel() can retire the parent and
+    // resetParent() this model. So the parent is used through a share of its
+    // ownership taken here: it stays alive for the call even if retired
+    // meanwhile (a retired model can't be made active again), and the call
+    // needs no modelsLock, so it is never dropped or delayed because a
+    // command or reload happens to hold that lock.
+    foundParent();
+    std::shared_ptr<PixelOverlayModel> p;
+    {
+        std::lock_guard<std::mutex> l(parentLock);
+        p = parentRef.lock();
+    }
 
     PixelOverlayModel::setState(st);
 
-    if (haveParent) {
-        parent->setChildState(name, st, xOffset, yOffset, width, height);
+    if (p) {
+        p->setChildState(name, st, xOffset, yOffset, width, height);
     }
 }
 void PixelOverlayModelSub::resetParent() {
@@ -245,7 +265,9 @@ void PixelOverlayModelSub::resetParent() {
     // activeModelsLock, which waits out a doOverlay() already reading
     // `parent` on the channel output thread. Only then is it safe to clear.
     PixelOverlayModel::setState(PixelOverlayState(PixelOverlayState::Disabled));
+    std::lock_guard<std::mutex> l(parentLock);
     parent = nullptr;
+    parentRef.reset();
 }
 std::string PixelOverlayModelSub::getParentName() const {
     return config["Parent"].asString();

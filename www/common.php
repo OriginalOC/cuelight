@@ -395,8 +395,13 @@ function JsonForScript($jsonText)
  * together without DHCP talk over it).  It refuses what can only be this
  * device: loopback, the unspecified address and "localhost" -- through those a
  * request would reach fppd's internal port or localonly/ pages that trust the
- * local address.  Callers must also not follow redirects, or a peer could
- * send the request back to loopback.
+ * local address.  A name is judged by every address it resolves to, the way
+ * curl will resolve it: inet_aton() reads 127.1, 2130706433, 0x7f000001 and
+ * 0177.0.0.1 as 127.0.0.1, and /etc/hosts maps ip6-localhost and this
+ * player's own HostName to loopback.  Callers must also not follow redirects,
+ * or a peer could send the request back to loopback, and must send the
+ * request to the addresses judged here (RemotePeerPinCurl(),
+ * RemotePeerConnectHost()): a name resolved again could answer differently.
  */
 function IsRemotePeerHost($host)
 {
@@ -404,22 +409,233 @@ function IsRemotePeerHost($host)
         return false;
     }
     if (filter_var($host, FILTER_VALIDATE_IP)) {
-        $packed = @inet_pton($host);
-        if ($packed === false) {
+        return RemotePeerAddressAllowed($host);
+    }
+    if (strcasecmp($host, 'localhost') == 0 || preg_match('/\.localhost$/i', $host) ||
+        preg_match('/^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$/', $host) !== 1) {
+        return false;
+    }
+    // A name that does not resolve could not be reached anyway.
+    $addrs = RemotePeerResolve($host);
+    if (empty($addrs)) {
+        return false;
+    }
+    foreach ($addrs as $addr) {
+        if (!RemotePeerAddressAllowed($addr)) {
             return false;
         }
-        // IPv4-mapped IPv6 (::ffff:a.b.c.d) is judged as the IPv4 address.
-        if (strlen($packed) == 16 && substr($packed, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
-            $packed = substr($packed, 12);
-        }
-        if (strlen($packed) == 4) {
-            $b = ord($packed[0]);
-            return !($b == 127 || $b == 0);
-        }
-        return !($packed === str_repeat("\0", 16) || $packed === str_repeat("\0", 15) . "\x01");
     }
-    return strcasecmp($host, 'localhost') != 0 && !preg_match('/\.localhost$/i', $host) &&
-        preg_match('/^(?=.{1,253}$)([a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?$/', $host) === 1;
+    RemotePeerApprovedAddresses($host, $addrs);
+    return true;
+}
+
+/**
+ * The addresses IsRemotePeerHost() approved for a name earlier in this
+ * request, or null; given $addrs, records them.
+ */
+function RemotePeerApprovedAddresses($host, $addrs = null)
+{
+    static $approved = array();
+    $key = strtolower($host);
+    if ($addrs !== null) {
+        $approved[$key] = array_values($addrs);
+    }
+    return $approved[$key] ?? null;
+}
+
+/**
+ * The approved addresses of a peer name, judging it first if this request
+ * has not; null when it is refused.  A literal address is its own answer.
+ */
+function RemotePeerPinnedAddresses($host)
+{
+    $bare = trim((string) $host, '[]');
+    if (filter_var($bare, FILTER_VALIDATE_IP)) {
+        return RemotePeerAddressAllowed($bare) ? array($bare) : null;
+    }
+    $addrs = RemotePeerApprovedAddresses($host);
+    if ($addrs === null && IsRemotePeerHost($host)) {
+        $addrs = RemotePeerApprovedAddresses($host);
+    }
+    return $addrs;
+}
+
+/**
+ * Point a curl handle for a peer URL at the addresses IsRemotePeerHost()
+ * approved for its host.  Left to itself curl resolves the name again, and a
+ * name with a short TTL can answer a LAN address to the check and loopback
+ * to curl (DNS rebinding).  Returns false, and leaves the handle unpinned,
+ * when the host is refused.
+ */
+function RemotePeerPinCurl($ch, $url)
+{
+    $parts = parse_url($url);
+    $host = isset($parts['host']) ? $parts['host'] : '';
+    $addrs = RemotePeerPinnedAddresses($host);
+    if (empty($addrs)) {
+        return false;
+    }
+    if (filter_var(trim($host, '[]'), FILTER_VALIDATE_IP)) {
+        return true;
+    }
+    $port = isset($parts['port']) ? $parts['port'] : ((($parts['scheme'] ?? 'http') == 'https') ? 443 : 80);
+    $list = array();
+    foreach ($addrs as $addr) {
+        $list[] = (strpos($addr, ':') !== false) ? '[' . $addr . ']' : $addr;
+    }
+    curl_setopt($ch, CURLOPT_RESOLVE, array($host . ':' . $port . ':' . implode(',', $list)));
+    return true;
+}
+
+/**
+ * The host to hand a tool that resolves names itself (rsync): the first
+ * address approved for a peer name, so it connects where the check looked.
+ * Null when the host is refused.
+ */
+function RemotePeerConnectHost($host)
+{
+    $addrs = RemotePeerPinnedAddresses($host);
+    if (empty($addrs)) {
+        return null;
+    }
+    return (strpos($addrs[0], ':') !== false) ? '[' . $addrs[0] . ']' : $addrs[0];
+}
+
+/** An IP address IsRemotePeerHost() accepts: not loopback or unspecified. */
+function RemotePeerAddressAllowed($ip)
+{
+    $packed = @inet_pton($ip);
+    if ($packed === false) {
+        return false;
+    }
+    // IPv4-mapped IPv6 (::ffff:a.b.c.d) is judged as the IPv4 address.
+    if (strlen($packed) == 16 && substr($packed, 0, 12) === str_repeat("\0", 10) . "\xff\xff") {
+        $packed = substr($packed, 12);
+    }
+    if (strlen($packed) == 4) {
+        $b = ord($packed[0]);
+        return !($b == 127 || $b == 0);
+    }
+    return !($packed === str_repeat("\0", 16) || $packed === str_repeat("\0", 15) . "\x01");
+}
+
+define('REMOTE_PEER_RESOLVE_SECONDS', 3);
+
+/**
+ * Every address a host name resolves to through the system resolver
+ * (getaddrinfo, as curl uses), IPv4 and IPv6; empty when it does not resolve.
+ * Bounded: a name whose DNS or mDNS lookup never answers comes back empty
+ * after REMOTE_PEER_RESOLVE_SECONDS, rather than holding the request for the
+ * resolver's own retries, and empty is refused.  getaddrinfo() takes no
+ * timeout, so on Linux the lookup runs in getent under timeout(1); elsewhere
+ * (macOS, a development host) it runs in-process.
+ */
+function RemotePeerResolve($host)
+{
+    $out = array();
+    if (is_executable('/usr/bin/getent') && is_executable('/usr/bin/timeout')) {
+        $lines = array();
+        @exec('/usr/bin/timeout ' . REMOTE_PEER_RESOLVE_SECONDS . ' /usr/bin/getent ahosts ' . escapeshellarg($host) . ' 2>/dev/null', $lines, $rc);
+        if ($rc !== 0) {
+            return array();
+        }
+        // "<address>  STREAM <name>" per address and socket type.
+        foreach ($lines as $line) {
+            $addr = strtok(trim($line), " \t");
+            if ($addr !== false && $addr !== '' && !in_array($addr, $out, true)) {
+                $out[] = $addr;
+            }
+        }
+        return $out;
+    }
+    if (!function_exists('socket_addrinfo_lookup')) {
+        // IPv4 only, through the same resolver.
+        $v4 = @gethostbynamel($host);
+        return is_array($v4) ? $v4 : array();
+    }
+    $infos = @socket_addrinfo_lookup($host, null, array('ai_socktype' => SOCK_STREAM));
+    if (is_array($infos)) {
+        foreach ($infos as $info) {
+            $e = socket_addrinfo_explain($info);
+            if (isset($e['ai_addr']['sin_addr'])) {
+                $out[] = $e['ai_addr']['sin_addr'];
+            } else if (isset($e['ai_addr']['sin6_addr'])) {
+                $out[] = $e['ai_addr']['sin6_addr'];
+            }
+        }
+    }
+    return $out;
+}
+
+/**
+ * Ask another player to act through one of the API routes that change state
+ * (docs/DEPRECATED.md): by POST, which FPP 11 will require, and by GET when
+ * the player is older than 10.3 and answers the POST 404 or 405.  Redirects
+ * are not followed (see IsRemotePeerHost()).
+ *
+ * @param string $url              http://<peer>/api/...
+ * @param int    $connectTimeoutMs
+ * @param int    $httpCode         set to the answer's HTTP status, 0 for none
+ * @return string|false            the body, or false on no answer or an HTTP error
+ */
+function RemotePlayerAction($url, $connectTimeoutMs, &$httpCode = null)
+{
+    foreach (array('POST', 'GET') as $method) {
+        $curl = curl_init($url);
+        if (!RemotePeerPinCurl($curl, $url)) {
+            curl_close($curl);
+            $httpCode = 0;
+            return false;
+        }
+        curl_setopt($curl, CURLOPT_FAILONERROR, true);
+        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, false);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, $connectTimeoutMs);
+        if ($method == 'POST') {
+            curl_setopt($curl, CURLOPT_POST, true);
+            curl_setopt($curl, CURLOPT_POSTFIELDS, '');
+        }
+        $body = curl_exec($curl);
+        $httpCode = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+        curl_close($curl);
+        if ($httpCode != 404 && $httpCode != 405) {
+            break;
+        }
+    }
+    return $body;
+}
+
+/**
+ * Run an fppd command by POST /command/<name>, its arguments a JSON array.
+ * GET /command/<name>/<args> is deprecated (docs/DEPRECATED.md), and needed
+ * every argument URL-encoded besides.
+ *
+ * @param string $command
+ * @param array  $args             strings; fppd takes a bool or number as its text
+ * @param int    $connectTimeoutMs
+ * @param int    $timeout          whole-request limit in seconds, 0 = none
+ * @param bool   $failOnError      false keeps the body of fppd's 500, which
+ *                                 says why it refused the command
+ * @param int    $httpCode         set to the answer's HTTP status, 0 for none
+ * @return string|false            the body, or false on no answer (and on an
+ *                                 HTTP error, with $failOnError)
+ */
+function FppdCommand($command, array $args = array(), $connectTimeoutMs = 200, $timeout = 0, $failOnError = true, &$httpCode = null)
+{
+    $curl = curl_init('http://localhost:32322/command/' . rawurlencode($command));
+    curl_setopt($curl, CURLOPT_POST, true);
+    curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode(array_values($args)));
+    curl_setopt($curl, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
+    curl_setopt($curl, CURLOPT_FAILONERROR, $failOnError);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, $connectTimeoutMs);
+    if ($timeout > 0) {
+        curl_setopt($curl, CURLOPT_TIMEOUT, $timeout);
+    }
+    $body = curl_exec($curl);
+    $httpCode = curl_getinfo($curl, CURLINFO_RESPONSE_CODE);
+    curl_close($curl);
+    return $body;
 }
 
 /**
@@ -2056,12 +2272,14 @@ function PrintSettingText($setting, $restart = 1, $reboot = 0, $maxlength = 32, 
     echo "
 <input type='text' id='$setting' class='mw-100' maxlength='$maxlength' size='$size' value=\"";
 
+    // Escaped: inside value="...", a saved value holding a quote ended the
+    // attribute, and with markup after it ran as part of the page.
     if (($pluginName == "") && isset($settings[$setting])) {
-        echo $settings[$setting];
+        echo htmlspecialchars((string)$settings[$setting], ENT_QUOTES);
     } elseif (isset($pluginSettings[$setting])) {
-        echo $pluginSettings[$setting];
+        echo htmlspecialchars((string)$pluginSettings[$setting], ENT_QUOTES);
     } else {
-        echo $defaultValue;
+        echo htmlspecialchars((string)$defaultValue, ENT_QUOTES);
     }
 
     echo "\">\n";
@@ -2183,7 +2401,8 @@ function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength =
         }
 
     }
-    echo $curValue;
+    // escaped, as in PrintSettingText()
+    echo htmlspecialchars((string)$curValue, ENT_QUOTES);
 
     echo "\" \n";
 
@@ -2211,6 +2430,12 @@ function PrintSettingTextSaved($setting, $restart = 1, $reboot = 0, $maxlength =
         echo "</datalist>\n";
     }
     if ($subType == 'color') {
+        // Also into a style attribute and a JS string below, where the
+        // escaping above doesn't reach: only a bare hex color goes there.
+        $curValue = (string)$curValue;
+        if (!preg_match('/^[0-9A-Fa-f]{6}$/', $curValue)) {
+            $curValue = preg_match('/^[0-9A-Fa-f]{6}$/', (string)$defaultValue) ? (string)$defaultValue : "000000";
+        }
         echo "<span id='$setting" . "_colorBox' class='color-box' style='background-color: #" . $curValue . ";'></span>";
         echo "<script>";
         echo "var $setting" . "SaveTimer = null;\n";
@@ -3179,8 +3404,18 @@ function get_remote_git_version()
         $cache_age = 900;
         $git_remote_version = "Unknown";
 
+        // A failed check is not cached (see below), so without this every
+        // status poll would pay for it again -- up to the whole timeout of an
+        // unreachable source, or of a ping that gets no reply.  Hold off
+        // re-checking for a minute after one fails.
+        $fail_marker = "/tmp/cache_" . $cachefile_name . ".failed";
+        if (file_exists($fail_marker) && time() - filemtime($fail_marker) < 60) {
+            $cached = @file_get_contents("/tmp/cache_" . $cachefile_name . ".cache");
+            return ($cached !== false && trim($cached) !== "") ? trim($cached) : "Unknown";
+        }
+
         //Check the cache for git_<branch>, if null is returned no cache file exists or it's expired, so then off to github
-        $git_remote_version = file_cache($cachefile_name, function () use ($origin) {
+        $git_remote_version = file_cache($cachefile_name, function () use ($origin, $fail_marker) {
             global $settings;
 
             $git_branch = getFPPBranch();
@@ -3231,7 +3466,7 @@ function get_remote_git_version()
                 // use ssh to access github, so fallback and check for a
                 // 'github' origin which can be setup to use https://
                 if ($git_remote_version == "") {
-                    $git_remote_version = exec("ping -q -c 1 github.com > /dev/null && (git --git-dir=" . $settings["fppDir"] . "/.git/ ls-remote -q -h github $git_branch 2>/dev/null | awk '$1 > 0 { print substr(\$1,1,9)}')", $output, $return_val);
+                    $git_remote_version = exec("ping -q -c 1 -W 1 github.com > /dev/null && (git --git-dir=" . $settings["fppDir"] . "/.git/ ls-remote -q -h github $git_branch 2>/dev/null | awk '$1 > 0 { print substr(\$1,1,9)}')", $output, $return_val);
                     if ($return_val != 0) {
                         $git_remote_version = "Unknown";
                     }
@@ -3247,8 +3482,10 @@ function get_remote_git_version()
             // window.  The "Unknown" default is re-applied below when no cached
             // value exists yet.
             if ($git_remote_version === "Unknown" || $git_remote_version === "") {
+                @touch($fail_marker);
                 return null;
             }
+            @unlink($fail_marker);
             return $git_remote_version;
         }, $cache_age, 30);
         if ($git_remote_version === "") {
@@ -3311,6 +3548,33 @@ function MatchesDeviceOSImage($name, $settings)
 }
 
 /**
+ * Built binaries start with an ELF/Mach-O header; a power loss after a build can
+ * leave them zero-filled (#3120).  Mirrors fppdBinaryValid() in scripts/common.
+ * @return bool
+ */
+function fppdBinaryValid()
+{
+    global $settings;
+
+    $binDir = $settings['fppBinDir'];
+    if (!is_executable($binDir . '/fppd')) {
+        return false;
+    }
+    $validMagic = array("\x7fELF", "\xcf\xfa\xed\xfe", "\xce\xfa\xed\xfe", "\xca\xfe\xba\xbe");
+    foreach (array('fppd', 'fppinit', 'libfpp.so', 'libfpp.dylib') as $name) {
+        $path = $binDir . '/' . $name;
+        if (!file_exists($path)) {
+            continue;
+        }
+        $magic = @file_get_contents($path, false, null, 0, 4);
+        if (!in_array($magic, $validMagic, true)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/**
  * Check for FPP updates via fppstats API
  * Returns unified update status for both branch upgrades and commit updates
  * @param string $latestReleaseVersion Optional pre-fetched latest release version (from GitHub API)
@@ -3337,9 +3601,10 @@ function check_fppstats_updates($latestReleaseVersion = null, $latestReleaseHasD
     // state: the branch matches no remote branch, and every release branch looks
     // newer than a version we cannot read, which previously produced a bogus
     // "FPP vX.Y is available for install" offer.  Report no updates at all and
-    // let the UI offer a rebuild instead.
+    // let the UI offer a rebuild instead.  A damaged build (#3120) does too.
     $versionUnknown = ($fppVersion === '' || $fppVersion === 'Unknown' ||
-        $currentBranch === '' || $currentBranch === 'Unknown');
+        $currentBranch === '' || $currentBranch === 'Unknown' ||
+        !fppdBinaryValid());
 
     $result = [
         'branchUpgradeAvailable' => false,
@@ -4007,6 +4272,41 @@ function network_redact_interface_config($cfg)
         }
     }
     return $cfg;
+}
+
+/**
+ * A config directory file that holds a credential: a dotfile (.htpasswd holds
+ * the UI password hash) or a saved interface (interface.* holds the WiFi
+ * keys).  The generic file routes -- /api/configfile and /api/file -- refuse
+ * these for read, write and delete alike, because /api can answer other
+ * origins.  Their own routes manage them without ever returning the secret:
+ * the UI password setting and /api/network/interface
+ * (network_redact_interface_config()).  $path is absolute; a path outside the
+ * config directory is never one.
+ */
+function ConfigPathIsCredential($path)
+{
+    global $settings;
+    $base = realpath($settings['configDirectory']);
+    if ($base === false || !is_string($path)) {
+        return false;
+    }
+    // The path as asked for and as resolved, so a link cannot name either.
+    foreach (array($path, realpath($path)) as $p) {
+        if (!is_string($p) || $p === $base || !PathIsWithin($p, $base)) {
+            continue;
+        }
+        $rel = substr($p, strlen($base) + 1);
+        foreach (explode('/', $rel) as $part) {
+            if ($part !== '' && $part[0] === '.') {
+                return true;
+            }
+        }
+        if (strpos($rel, '/') === false && stripos($rel, 'interface.') === 0) {
+            return true;
+        }
+    }
+    return false;
 }
 
 function network_list_interfaces_obj()
@@ -5131,9 +5431,10 @@ function SaveBackupMetadataCache($cache)
  * @param string $backup_comment
  * @param string|null $backup_trigger_source
  * @param array $blob_refs Blob hashes the backup references, as keys.
+ * @param int|null $backup_taken The backup's own backup_taken (UNIX time).
  * @return bool
  */
-function RememberBackupMetadata($backup_file_path, $backup_comment, $backup_trigger_source, $blob_refs = array())
+function RememberBackupMetadata($backup_file_path, $backup_comment, $backup_trigger_source, $blob_refs = array(), $backup_taken = null)
 {
     clearstatcache(true, $backup_file_path);
     $size = @filesize($backup_file_path);
@@ -5150,6 +5451,7 @@ function RememberBackupMetadata($backup_file_path, $backup_comment, $backup_trig
         'backup_comment' => $backup_comment,
         'backup_trigger_source' => $backup_trigger_source,
         'blob_refs' => array_values($blob_refs),
+        'backup_taken' => $backup_taken,
     );
 
     return SaveBackupMetadataCache($cache);
@@ -5222,7 +5524,8 @@ function DoJsonBackupToUSB()
         //Build up the URL, include the necessary params so we can call it and have JSON Backups copied across
         $url = FPPSelfBaseURL() . '/copystorage.php?wrapped=1&direction=TOUSB&path=' . urlencode($fileCopy_BackupPath) . '&storageLocation=' . $selected_jsonConfigBackupUSBLocation . '&flags=JsonBackups&delete=no';
 
-        if (file_get_contents($url, false) === false) {
+        $ctx = stream_context_create(array('http' => array('method' => 'POST')));
+        if (file_get_contents($url, false, $ctx) === false) {
             /* Handle error */
             error_log(
                 'DoJsonBackupToUSB: Something went wrong trying to call filecopy endpoint to copy JSON Backups to the specified device. (' . json_encode(
@@ -5867,5 +6170,99 @@ function GetSerialDevices()
     }
     return $devices;
 }
+
+/**
+ * Whether resolved path $path is $base itself or lies under it.  A bare
+ * prefix test also let a sibling through: /home/fpp/media/config-old
+ * starts with /home/fpp/media/config.
+ *
+ * @param string $path a realpath()ed path
+ * @param string $base a realpath()ed directory
+ * @return bool
+ */
+function PathIsWithin($path, $base)
+{
+    if (!is_string($path) || !is_string($base) || $base === '') {
+        return false;
+    }
+    $base = rtrim($base, '/');
+    return $path === $base || strncmp($path, $base . '/', strlen($base) + 1) === 0;
+}
+
+/**
+ * The state-changing route this GET request is for, or '' if it is none.
+ *
+ * These routes (docs/DEPRECATED.md, "HTTP API: routes that change state but
+ * answer GET") will require POST in FPP 11: over plain HTTP any web page can
+ * make a browser send them a GET.  Until then they keep working by GET and
+ * are only marked.  Keep this list in step with rule 2 of the cross-site gate
+ * in etc/apache2.site.  GET /api/command/... is fppd's and is marked there.
+ *
+ * @return string
+ */
+function DeprecatedStateChangingGetRoute()
+{
+    if (($_SERVER['REQUEST_METHOD'] ?? '') !== 'GET') {
+        return '';
+    }
+    static $pages = array('changebranch', 'copystorage', 'disableKiosk', 'flash-storage', 'formatstorage',
+        'gitCheckoutVersion', 'growsd', 'installKiosk', 'manualUpdate', 'newpartitionsd', 'packagesHelper',
+        'rebootRemoteFPP', 'rebuildfpp', 'resetConfig', 'restartRemoteFPPD', 'run_mp3gain', 'runEventScript',
+        'shutdownRemoteFPP', 'upgradeCapeFirmware', 'upgradefpp', 'upgradeOS');
+    $script = basename($_SERVER['SCRIPT_NAME'] ?? '', '.php');
+    if (in_array($script, $pages, true)) {
+        return $script . '.php';
+    }
+    $path = parse_url($_SERVER['REQUEST_URI'] ?? '', PHP_URL_PATH);
+    // remoteAction also serves reads (listUpgrades, updateLog) to the
+    // MultiSync page; only the actions that change the remote are marked.
+    if (is_string($path) && preg_match('#^/api/remoteAction$#i', $path) &&
+        in_array($_GET['action'] ?? '', array('reboot', 'restartFppd'), true)) {
+        return '/api/remoteAction?action=' . $_GET['action'];
+    }
+    if (is_string($path) && preg_match('#^/api/(events/[^/]+/trigger|file/move/|git/reset$|network/interface/add/|playlists/(stop|pause|resume|stopgracefully|stopgracefullyafterloop)$|playlist/[^/]+/start|playlist/repeat/|plugin/[^/]+/upgrade$|sequence/current/(stop|togglePause)$|sequence/[^/]+/start/|scripts/[^/]+/run$|system/(reboot|shutdown)$|system/fppd/(start|stop|restart)$)#i', $path, $m)) {
+        return '/api/' . $m[1];
+    }
+    return '';
+}
+
+/**
+ * Mark a GET to a state-changing route as deprecated: a Deprecation response
+ * header every time, and a line in fppd.log at most once an hour per route and
+ * client, so whoever still calls it by GET can be found before FPP 11.
+ *
+ * @return void
+ */
+function NoteDeprecatedStateChangingGet()
+{
+    $route = DeprecatedStateChangingGetRoute();
+    if ($route === '') {
+        return;
+    }
+    if (!headers_sent()) {
+        header('Deprecation: true');
+    }
+    $client = $_SERVER['REMOTE_ADDR'] ?? '?';
+    if (!empty($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $client .= ' for ' . $_SERVER['HTTP_X_FORWARDED_FOR'];
+    }
+    $client = substr(preg_replace('/[^\x20-\x7e]/', '', $client), 0, 100);
+    $agent = substr(preg_replace('/[^\x20-\x7e]/', '', $_SERVER['HTTP_USER_AGENT'] ?? ''), 0, 100);
+
+    $dir = sys_get_temp_dir() . '/fpp-deprecated-get';
+    $stamp = $dir . '/' . md5($route . '|' . $client);
+    $last = @filemtime($stamp);
+    if ($last !== false && $last > time() - 3600) {
+        return;
+    }
+    @mkdir($dir, 0775, true);
+    @touch($stamp);
+    require_once __DIR__ . '/common/oplog.inc.php';
+    FppdLogLine('apache', 'General', 'Deprecated: GET ' . $route . ' from ' . $client .
+        ($agent !== '' ? ' (' . $agent . ')' : '') .
+        ' changes state; FPP 11 will require POST for it (docs/DEPRECATED.md)');
+}
+
+NoteDeprecatedStateChangingGet();
 
 ?>

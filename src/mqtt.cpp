@@ -17,7 +17,10 @@
 
 #include <atomic>
 #include <cstring>
+#include <fcntl.h>
+#include <chrono>
 #include <functional>
+#include <future>
 #include <list>
 #include <map>
 #include <memory>
@@ -25,12 +28,14 @@
 #include <mutex>
 #include <stdlib.h>
 #include <string>
+#include <thread>
 #include <unistd.h>
 #include <vector>
 
 #include "Events.h"
 #include "Timers.h"
 #include "Warnings.h"
+#include "common.h"      // SetThreadName() -- needed directly for NOPCH builds
 #include "common_mini.h" // FPPstrerror(), FPPrand() -- needed directly for NOPCH builds
 #include "log.h"
 #include "mqtt.h"
@@ -84,7 +89,25 @@ void mosq_disc_callback(struct mosquitto* mosq, void* userdata, int level) {
 static int mqttConnectRefusals = 0;
 static long long mqttLastRefusalLogMS = 0;
 
+// The network thread, running mosquitto_loop_forever(), and its signal that
+// the loop has returned (see ~MosquittoClient()).  Kept here rather than in
+// MosquittoClient, whose layout plugins compile in (see mqtt.h).
+static std::thread mqttLoopThread;
+static std::future<void> mqttLoopStopped;
+
+// libmosquitto opens its connection to the broker without close-on-exec, and
+// has no hook to open it another way, so every shell and tool fppd ran
+// inherited it. Mark it once it is open: here, on each connect, since a
+// reconnect opens a new one, and straight after the first connect starts.
+static void MarkBrokerSocketCloseOnExec(struct mosquitto* mosq) {
+    int fd = mosquitto_socket(mosq);
+    if (fd >= 0) {
+        fcntl(fd, F_SETFD, FD_CLOEXEC);
+    }
+}
+
 void mosq_connect_callback(struct mosquitto* mosq, void* userdata, int rc) {
+    MarkBrokerSocketCloseOnExec(mosq);
     if (rc != 0) {
         mqttConnectRefusals++;
         long long now = GetMonotonicTimeMS();
@@ -169,13 +192,37 @@ MosquittoClient::~MosquittoClient() {
     // "ready" = 0 itself (Events::PrepareForShutdown), ahead of the
     // DISCONNECT in the same queue.
     //
-    // The connect/disconnect callbacks go first: the disconnect this causes
-    // would otherwise run HandleDisconnect(), whose timer captures this object.
+    // The callbacks go first: the disconnect this causes would otherwise run
+    // HandleDisconnect(), whose timer captures this object, and the others
+    // reach this object through the global `mqtt`.
+    //
+    // The join is bounded.  With the broker unreachable the thread can be
+    // inside a blocking connect() (about two minutes when SYNs are dropped),
+    // or a message callback can be stuck in a command, and fppd's restart and
+    // shutdown waited on it.  Every path from here ends in exec or _exit, so
+    // past the bound the client is left to the thread and never freed.
+    //
+    // The thread is ours, not mosquitto_loop_start()'s, so the join does not
+    // depend on libmosquitto still seeing it running: its own thread clears
+    // mosq->threaded on the way out, and a mosquitto_loop_stop() that read
+    // that first returned MOSQ_ERR_INVAL without joining, leaving
+    // mosquitto_destroy() to free the client under the exiting thread.
     if (m_mosq) {
+        mosquitto_message_callback_set(m_mosq, nullptr);
+        mosquitto_log_callback_set(m_mosq, nullptr);
         mosquitto_connect_callback_set(m_mosq, nullptr);
         mosquitto_disconnect_callback_set(m_mosq, nullptr);
         mosquitto_disconnect(m_mosq);
-        mosquitto_loop_stop(m_mosq, false);
+
+        if (mqttLoopThread.joinable()) {
+            if (mqttLoopStopped.wait_for(std::chrono::seconds(3)) != std::future_status::ready) {
+                LogWarn(VB_CONTROL, "MQTT network thread did not stop within 3 s; leaving it\n");
+                mqttLoopThread.detach();
+                mqtt = NULL;
+                return;
+            }
+            mqttLoopThread.join();
+        }
     }
 
     mosquitto_destroy(m_mosq);
@@ -226,6 +273,9 @@ int MosquittoClient::Init(const std::string& username, const std::string& passwo
         return 0;
     }
     mosquitto_user_data_set(m_mosq, this);
+    // The network loop runs on a thread of our own (below), so libmosquitto
+    // has to lock as it would for mosquitto_loop_start().
+    mosquitto_threaded_set(m_mosq, true);
     mosquitto_log_callback_set(m_mosq, mosq_log_callback);
     mosquitto_disconnect_callback_set(m_mosq, mosq_disc_callback);
     mosquitto_connect_callback_set(m_mosq, mosq_connect_callback);
@@ -261,6 +311,7 @@ int MosquittoClient::Init(const std::string& username, const std::string& passwo
     }
 
     rc = mosquitto_connect_async(m_mosq, m_host.c_str(), m_port, m_keepalive);
+    MarkBrokerSocketCloseOnExec(m_mosq);
 
     if (rc) {
         LogErr(VB_CONTROL, "Error, unable to connect to Mosquitto Broker at %s: %d\n",
@@ -269,9 +320,21 @@ int MosquittoClient::Init(const std::string& username, const std::string& passwo
         return 0;
     }
 
-    int loop = mosquitto_loop_start(m_mosq);
-    if (loop != MOSQ_ERR_SUCCESS) {
-        LogErr(VB_CONTROL, "Error, unable to start Mosquitto loop: %d\n", loop);
+    // What mosquitto_loop_start() would run, on a thread the destructor can
+    // join: sleep for the keepalive (or a day without one) between packets,
+    // since publish() and disconnect() wake the loop.
+    struct mosquitto* m = m_mosq;
+    int timeout = m_keepalive ? m_keepalive * 1000 : 1000 * 86400;
+    auto stopped = std::make_shared<std::promise<void>>();
+    mqttLoopStopped = stopped->get_future();
+    try {
+        mqttLoopThread = std::thread([m, timeout, stopped]() {
+            SetThreadName("FPP-MQTT");
+            mosquitto_loop_forever(m, timeout, 1);
+            stopped->set_value();
+        });
+    } catch (const std::system_error& e) {
+        LogErr(VB_CONTROL, "Error, unable to start Mosquitto loop: %s\n", e.what());
         return 0;
     }
 
@@ -547,11 +610,35 @@ void MosquittoClient::MessageCallback(void* obj, const struct mosquitto_message*
             message->topic);
 }
 
+// Every message on every subscribed topic is cached, for conditions,
+// variables and playlist branches to read.  Unbounded, a broker with many
+// topics -- or anyone who can publish under the subscribed wildcards, one
+// topic name after another -- grew fppd until it ran out of memory.  Past
+// these, the topic updated longest ago makes room, and a payload too large
+// to be a value anything here compares is not kept.
+static constexpr size_t MQTT_CACHE_MAX_TOPICS = 4096;
+static constexpr size_t MQTT_CACHE_MAX_PAYLOAD = 64 * 1024;
+
 void MosquittoClient::CacheSetMessage(std::string& topic, std::string& message) {
     std::unique_lock<std::mutex> lock(messageCacheLock);
 
     LogDebug(VB_CONTROL, "MosquittoClient::CacheSetMessage('%s', '%s')\n", topic.c_str(), message.c_str());
 
+    if (message.size() > MQTT_CACHE_MAX_PAYLOAD) {
+        // not an older, smaller value standing in for it either
+        messageCache.erase(topic);
+        return;
+    }
+    auto it = messageCache.find(topic);
+    if (it == messageCache.end() && messageCache.size() >= MQTT_CACHE_MAX_TOPICS) {
+        auto oldest = messageCache.begin();
+        for (auto e = messageCache.begin(); e != messageCache.end(); ++e) {
+            if (e->second.lastUpdated < oldest->second.lastUpdated) {
+                oldest = e;
+            }
+        }
+        messageCache.erase(oldest);
+    }
     messageCache[topic] = { message, time(nullptr) };
 }
 

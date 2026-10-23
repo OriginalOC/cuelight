@@ -14,6 +14,8 @@
 
 #include "DrmCards.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <map>
 #include <mutex>
 #include <set>
@@ -37,13 +39,23 @@ struct Card {
     int fd = -1;
     int refCount = 0;
     bool master = false;
+    bool masterWarned = false;
     std::set<uint32_t> claimed;  // driven by a framebuffer output
-    std::set<uint32_t> leased;   // held by a live lease
+    // Held by a live lease or a lease-less holder, counted per holder: the
+    // fallback in AcquireLease() hands a second holder the shared fd for a
+    // connector someone already holds, and with a plain set the first
+    // holder's release cleared the mark the second was still relying on (its
+    // framebuffer output then drew over the video).
+    std::map<uint32_t, int> leased;
+    // Connectors whose lease a teardown still has to release (RetireLease()).
+    std::map<uint32_t, int> retiring;
 };
 // Guards the table and the per-card sets.  Never held across a blocking DRM
 // call that waits on the display.
 std::mutex s_lock;
 std::map<std::string, Card> s_cards;
+// Notified, under s_lock, by every ReleaseLease() of a retiring lease.
+std::condition_variable s_retired;
 
 Card* CardForFdLocked(int fd) {
     for (auto& [path, card] : s_cards) {
@@ -52,6 +64,32 @@ Card* CardForFdLocked(int fd) {
         }
     }
     return nullptr;
+}
+
+bool EnsureMasterLocked(const std::string& cardPath, Card& card) {
+    if (!card.master) {
+        card.master = ioctl(card.fd, DRM_IOCTL_SET_MASTER, 0) == 0;
+        if (!card.master && !card.masterWarned) {
+            LogWarn(VB_MEDIAOUT, "DRM: no DRM master on %s (%s); another process holds it\n",
+                    cardPath.c_str(), strerror(errno));
+            card.masterWarned = true;
+        } else if (card.master) {
+            card.masterWarned = false;
+        }
+    }
+    return card.master;
+}
+
+// Master is held only while something here needs it: a framebuffer output
+// driving the card, or a live lease, whose lessee is master only while its
+// lessor is.  Kept on a card fppd merely opened, it locked out every other
+// DRM client there: X or a kiosk started after fppd stayed dark, and fbcon
+// could no longer relight a monitor plugged in later.
+void DropMasterIfIdleLocked(Card& card) {
+    if (card.master && card.claimed.empty() && card.leased.empty()) {
+        ioctl(card.fd, DRM_IOCTL_DROP_MASTER, 0);
+        card.master = false;
+    }
 }
 
 int PlaneType(int fd, uint32_t planeId) {
@@ -89,15 +127,13 @@ int Acquire(const std::string& cardPath) {
     Card card;
     card.fd = fd;
     card.refCount = 1;
-    // A new fd on a card with no master becomes master by itself; asking
-    // covers the case where it didn't.
-    card.master = ioctl(fd, DRM_IOCTL_SET_MASTER, 0) == 0;
-    if (!card.master) {
-        LogWarn(VB_MEDIAOUT, "DRM: %s opened without DRM master (%s); another process holds it\n",
-                cardPath.c_str(), strerror(errno));
-    }
+    // A new fd on a card with no master becomes master by itself.  Nothing
+    // is claimed or leased yet, so give it back; EnsureMaster() takes it
+    // when there is something to drive.
+    card.master = true;
+    DropMasterIfIdleLocked(card);
     s_cards[cardPath] = card;
-    LogDebug(VB_MEDIAOUT, "DRM: opened %s fd=%d master=%d\n", cardPath.c_str(), fd, card.master);
+    LogDebug(VB_MEDIAOUT, "DRM: opened %s fd=%d\n", cardPath.c_str(), fd);
     return fd;
 }
 
@@ -120,14 +156,12 @@ void Release(const std::string& cardPath) {
 
 bool EnsureMaster(int fd) {
     std::lock_guard<std::mutex> lock(s_lock);
-    Card* card = CardForFdLocked(fd);
-    if (!card) {
-        return ioctl(fd, DRM_IOCTL_SET_MASTER, 0) == 0;
+    for (auto& [path, card] : s_cards) {
+        if (card.fd == fd) {
+            return EnsureMasterLocked(path, card);
+        }
     }
-    if (!card->master) {
-        card->master = ioctl(fd, DRM_IOCTL_SET_MASTER, 0) == 0;
-    }
-    return card->master;
+    return ioctl(fd, DRM_IOCTL_SET_MASTER, 0) == 0;
 }
 
 void Claim(int fd, uint32_t objectId) {
@@ -141,6 +175,7 @@ void Unclaim(int fd, uint32_t objectId) {
     std::lock_guard<std::mutex> lock(s_lock);
     if (Card* card = CardForFdLocked(fd)) {
         card->claimed.erase(objectId);
+        DropMasterIfIdleLocked(*card);
     }
 }
 
@@ -162,6 +197,25 @@ Lease AcquireLease(const std::string& cardPath, int connectorId) {
     if (connectorId <= 0) {
         return lease;
     }
+    lease.connectorId = connectorId;
+    {
+        // A consumer restarted after its pipeline died asks for the connector
+        // within milliseconds of the stop, while the old pipeline's teardown
+        // thread still holds its lease.  Found held, the connector got no
+        // CRTC and the new kmssink the card's shared fd, the one the
+        // framebuffer outputs flip on.  Wait for that release instead; a
+        // teardown wedged past this still falls back as before.  Before
+        // drmMasterLock, which the framebuffer outputs' flips take.
+        std::unique_lock<std::mutex> lock(s_lock);
+        auto retiring = [&cardPath, connectorId]() {
+            auto card = s_cards.find(cardPath);
+            return card != s_cards.end() && card->second.retiring.count((uint32_t)connectorId);
+        };
+        if (retiring() && !s_retired.wait_for(lock, std::chrono::seconds(2), [&retiring]() { return !retiring(); })) {
+            LogWarn(VB_MEDIAOUT, "DRM: %s connector %d is still held by a teardown after 2 s\n",
+                    cardPath.c_str(), connectorId);
+        }
+    }
     int fd = Acquire(cardPath);
     if (fd < 0) {
         LogErr(VB_MEDIAOUT, "DRM: cannot open %s: %s\n", cardPath.c_str(), strerror(errno));
@@ -170,10 +224,12 @@ Lease AcquireLease(const std::string& cardPath, int connectorId) {
     // drmModeCreateLease, and keeping the framebuffer outputs off the card
     // while it is chosen.
     std::unique_lock<std::mutex> masterLock(drmMasterLock);
-    EnsureMaster(fd);
 
+    // Master is taken under the same lock that records the lease, so an
+    // Unclaim() in between can't see an idle card and drop it again.
     std::unique_lock<std::mutex> lock(s_lock);
     Card& card = s_cards[cardPath];
+    EnsureMasterLocked(cardPath, card);
     auto leasable = [&card](uint32_t id) { return !card.leased.count(id); };
     auto unused = [&card](uint32_t id) { return !card.leased.count(id) && !card.claimed.count(id); };
 
@@ -263,7 +319,7 @@ Lease AcquireLease(const std::string& cardPath, int connectorId) {
             lease.isLease = true;
             lease.lesseeId = lessee;
             for (int i = 0; i < lease.objectCount; i++) {
-                card.leased.insert(lease.objects[i]);
+                card.leased[lease.objects[i]]++;
             }
             LogDebug(VB_MEDIAOUT, "DRM: lease %u on %s: connector %d crtc %u primary %u overlay %u\n",
                      lessee, cardPath.c_str(), connectorId, crtcId, primary, overlay);
@@ -278,19 +334,26 @@ Lease AcquireLease(const std::string& cardPath, int connectorId) {
     // No lease: kmssink on the shared, master fd, as before leases.  Mark the
     // connector and the overlay it gets as held all the same, so a
     // framebuffer output there stands aside and no one else takes the plane.
-    // Only what this call took is recorded, so its release can't clear a
-    // mark that belongs to another holder of the connector.
+    // Each holder counts once, so a release drops only its own hold and a
+    // mark another holder of the connector still relies on stays.
     lease.objectCount = 0;
-    if (!card.leased.count((uint32_t)connectorId)) {
-        lease.objects[lease.objectCount++] = (uint32_t)connectorId;
-        card.leased.insert((uint32_t)connectorId);
-    }
+    lease.objects[lease.objectCount++] = (uint32_t)connectorId;
+    card.leased[(uint32_t)connectorId]++;
     if (overlay) {
         lease.objects[lease.objectCount++] = overlay;
-        card.leased.insert(overlay);
+        card.leased[overlay]++;
     }
     lease.fd = fd;
     return lease;
+}
+
+void RetireLease(Lease& lease) {
+    if (lease.fd < 0 || lease.connectorId <= 0 || lease.retired) {
+        return;
+    }
+    std::lock_guard<std::mutex> lock(s_lock);
+    s_cards[lease.cardPath].retiring[(uint32_t)lease.connectorId]++;
+    lease.retired = true;
 }
 
 void ReleaseLease(Lease& lease) {
@@ -301,9 +364,20 @@ void ReleaseLease(Lease& lease) {
         std::lock_guard<std::mutex> lock(s_lock);
         auto it = s_cards.find(lease.cardPath);
         if (it != s_cards.end()) {
-            for (int i = 0; i < lease.objectCount; i++) {
-                it->second.leased.erase(lease.objects[i]);
+            auto retiring = it->second.retiring.find((uint32_t)lease.connectorId);
+            if (lease.retired && retiring != it->second.retiring.end()) {
+                if (--retiring->second <= 0) {
+                    it->second.retiring.erase(retiring);
+                }
+                s_retired.notify_all();
             }
+            for (int i = 0; i < lease.objectCount; i++) {
+                auto held = it->second.leased.find(lease.objects[i]);
+                if (held != it->second.leased.end() && --held->second <= 0) {
+                    it->second.leased.erase(held);
+                }
+            }
+            DropMasterIfIdleLocked(it->second);
         }
     }
     if (lease.isLease) {
@@ -331,6 +405,7 @@ Lease AcquireLease(const std::string& cardPath, int) {
     l.cardPath = cardPath;
     return l;
 }
+void RetireLease(Lease&) {}
 void ReleaseLease(Lease& lease) { lease = Lease(); }
 } // namespace DrmCards
 

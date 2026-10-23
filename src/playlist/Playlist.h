@@ -12,6 +12,7 @@
  */
 
 #include <atomic>
+#include "AtomicSharedPtr.h"
 #include "fpp-json.h"
 #include <list>
 #include <memory>
@@ -34,9 +35,11 @@ enum PlaylistStatus {
 // handed the player back to the one it interrupted (see Playlist.cpp).
 bool InHandedBackStoppedPreset();
 
-class Playlist {
+// Owned through Player::CreatePlaylist(); weak_from_this() hands an inserted
+// child an owning reference to the level it interrupted.
+class Playlist : public std::enable_shared_from_this<Playlist> {
 public:
-    Playlist(Playlist* parent = NULL);
+    Playlist(std::shared_ptr<Playlist> parent = nullptr);
     ~Playlist();
 
     PlaylistStatus getPlaylistStatus();
@@ -83,6 +86,7 @@ public:
     void SetRepeat(int repeat);
 
     void RandomizeMainPlaylist();
+    int ShuffleMainPlaylistFrom(int position);
 
     void Dump(void);
 
@@ -98,17 +102,19 @@ public:
     Json::Value GetInfo(void);
     void GetInfo(Json::Value& v);
     std::string GetPlaylistName(void);
-    int GetRepeat(void) { return m_repeat; }
+    // These getters are called from the scheduler, status, MQTT and API
+    // threads without m_playlistMutex, so the members behind them are atomic.
+    int GetRepeat(void) { return m_repeat.load(std::memory_order_relaxed); }
     int GetPosition(void);
     int GetResumePosition(void);
     int GetSize(void);
-    int GetLoopNumber(void) { return (m_loop + 1); }
+    int GetLoopNumber(void) { return (m_loop.load(std::memory_order_relaxed) + 1); }
     std::string GetConfigStr(void);
     Json::Value GetConfig(void);
-    uint64_t GetFileTime(void) { return (Json::UInt64)m_fileTime; }
-    int GetForceStop(void) { return m_forceStop; }
-    int WasScheduled(void) { return (m_scheduleEntry != -1) ? 1 : 0; }
-    int GetScheduleEntry(void) { return m_scheduleEntry; }
+    uint64_t GetFileTime(void) { return (Json::UInt64)m_fileTime.load(std::memory_order_relaxed); }
+    int GetForceStop(void) { return m_forceStop.load(std::memory_order_relaxed); }
+    int WasScheduled(void) { return (GetScheduleEntry() != -1) ? 1 : 0; }
+    int GetScheduleEntry(void) { return m_scheduleEntry.load(std::memory_order_relaxed); }
 
     // these Positions are 0 based and includes the leadIn entries
     uint64_t GetCurrentPosInMS();
@@ -177,11 +183,13 @@ private:
     // well-defined; volatile never made them so.
     std::atomic<PlaylistStatus> m_status;
 
-    // Atomic (same size and place as the raw pointer it replaces): status
-    // threads walk the chain for breadcrumbs while the main loop retires
-    // levels, and a level is cut loose (nulled) when it is retired so nothing
-    // reaches a freed parent through it.
-    std::atomic<Playlist*> m_parent;
+    // The level this one interrupted, owned: a thread holding a snapshot of a
+    // level can walk to every parent it still links to (status breadcrumbs,
+    // SetIdle's hand-back, a graceful stop) while the main loop releases
+    // levels, and each parent stays alive until the last level linking to it
+    // lets go.  A level is cut loose (nulled) when it is retired, so a retired
+    // level doesn't keep its parent alive either.
+    AtomicSharedPtr<Playlist> m_parent;
     std::string m_filename;
     std::string m_name;
     std::string m_desc;
@@ -194,20 +202,23 @@ private:
     // file" apart from "a saved playlist is playing".  Never true for a
     // playlist loaded from a .json file.
     bool m_generatedOnTheFly = false;
-    int m_repeat;
-    int m_loop;
+    // Atomic, read lock-free by the inline getters above.  Each is the same
+    // size and in the same place as the plain field it replaces, so a plugin
+    // built against the old header still reads the right value.
+    std::atomic<int> m_repeat;
+    std::atomic<int> m_loop;
     int m_loopCount;
     int m_random;
     int m_blankAtEnd;
     long long m_startTime;
     int m_subPlaylistDepth;
-    int m_scheduleEntry;
-    int m_forceStop;
+    std::atomic<int> m_scheduleEntry;
+    std::atomic<int> m_forceStop;
     int m_stopAtPos;
     int m_loadStartPos;
     int m_loadEndPos;
 
-    time_t m_fileTime;
+    std::atomic<time_t> m_fileTime;
     Json::Value m_config;
     time_t m_configTime;
     Json::Value m_playlistInfo;

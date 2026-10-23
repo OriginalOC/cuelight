@@ -20,6 +20,7 @@
 #include "../PixelOverlayModel.h"
 
 #include <cmath>
+#include <mutex>
 #include <math.h>
 #include <time.h>
 
@@ -200,8 +201,12 @@ public:
 
         // Build pipeline: pipewiresrc target-object=<node> ! audioconvert ! audioresample !
         //   audio/x-raw,format=S16LE,channels=1,rate=44100 ! appsink name=wledsink
+        // The node name is set as a property after parsing, never pasted into
+        // the description: it comes from the WLEDAudioInput setting (writable
+        // over the network), and pasted in, "x ! filesrc location=... ! ..."
+        // added elements that read or wrote any file as root.
         std::string pipelineStr =
-            "pipewiresrc target-object=" + dev + " ! audioconvert ! audioresample ! "
+            "pipewiresrc name=wledsrc ! audioconvert ! audioresample ! "
             "audio/x-raw,format=S16LE,channels=1,rate=44100 ! "
             "appsink name=wledsink max-buffers=2 drop=true";
 
@@ -211,7 +216,15 @@ public:
             WarningHolder::AddWarning(52, "WLED Sound Reactive - GStreamer pipeline error: " + std::string(error->message));
             LogErr(VB_MEDIAOUT, "WLED GStreamer capture pipeline error: %s\n", error->message);
             g_error_free(error);
+            if (gstPipeline) {
+                gst_object_unref(gstPipeline);
+                gstPipeline = nullptr;
+            }
             return;
+        }
+        if (GstElement* src = gst_bin_get_by_name(GST_BIN(gstPipeline), "wledsrc")) {
+            g_object_set(src, "target-object", dev.c_str(), nullptr);
+            gst_object_unref(src);
         }
 
         GstElement* appsink = gst_bin_get_by_name(GST_BIN(gstPipeline), "wledsink");
@@ -278,8 +291,10 @@ public:
 
         // Build pipeline: alsasrc device=<dev> ! audioconvert ! audioresample !
         //   audio/x-raw,format=S16LE,channels=1,rate=44100 ! appsink
+        // The device is set as a property, not pasted into the description;
+        // see openGStreamerCapture().
         std::string pipelineStr =
-            "alsasrc device=" + dev + " ! audioconvert ! audioresample ! "
+            "alsasrc name=wledsrc ! audioconvert ! audioresample ! "
             "audio/x-raw,format=S16LE,channels=1,rate=44100 ! "
             "appsink name=wledsink max-buffers=2 drop=true";
 
@@ -289,7 +304,15 @@ public:
             WarningHolder::AddWarning(52, "WLED Sound Reactive - Could not open Audio Input Device: " + dev + "  Error: " + std::string(error->message));
             LogErr(VB_MEDIAOUT, "WLED GStreamer ALSA capture pipeline error: %s\n", error->message);
             g_error_free(error);
+            if (gstPipeline) {
+                gst_object_unref(gstPipeline);
+                gstPipeline = nullptr;
+            }
             return;
+        }
+        if (GstElement* src = gst_bin_get_by_name(GST_BIN(gstPipeline), "wledsrc")) {
+            g_object_set(src, "device", dev.c_str(), nullptr);
+            gst_object_unref(src);
         }
 
         GstElement* appsink = gst_bin_get_by_name(GST_BIN(gstPipeline), "wledsink");
@@ -334,6 +357,11 @@ public:
     }
 
     bool getAudioSamples(std::array<float, NUM_SAMPLES>& samples, int& sampleRate) {
+        // Called from the overlay effect thread (reactive effects) and the
+        // WLEDAudioSync thread: both opened the capture on first use (one
+        // pipeline leaked) and filled inputSamples at once.  Every pull is
+        // non-blocking, so holding this over the call costs little.
+        std::lock_guard<std::mutex> lk(sourceLock);
         if (sourceType == -1) {
             std::string source = getSetting("WLEDAudioInput", "-- Playing Media --");
             if (source == "-- Playing Media --") {
@@ -365,6 +393,7 @@ public:
         return retValue;
     }
 
+    std::mutex sourceLock;
     int sourceType = -1;
     std::array<float, NUM_SAMPLES> inputSamples;
     int inputSampleRate = 44100;
@@ -493,31 +522,29 @@ WS2812FXExt::WS2812FXExt(PixelOverlayModel* m, int map, int b,
             mapping = 0;
         }
     }
-
     Panel p;
+    int segW, segH;
     if (polar) {
         // The segment IS the polar buffer: x = radius, y = angle (or the other
         // way round for the Angular modes). getLength() below must agree with
         // this or effects index past the LUT.
-        _segments.push_back(Segment(0, polar->width, 0, polar->height));
-        p.width = polar->width;
-        p.height = polar->height;
-        isMatrix = polar->width > 1 && polar->height > 1;
+        segW = polar->width;
+        segH = polar->height;
     } else if (mapping == 0 || mapping == 2) {
-        if (m->getWidth() > 1 && m->getHeight() > 1) {
-            isMatrix = true;
-        }
-        _segments.push_back(Segment(0, m->getWidth(), 0, m->getHeight()));
-        p.width = m->getWidth();
-        p.height = m->getHeight();
+        segW = m->getWidth();
+        segH = m->getHeight();
     } else {
-        if (m->getWidth() > 1 && m->getHeight() > 1) {
-            isMatrix = true;
-        }
-        _segments.push_back(Segment(0, m->getHeight(), 0, m->getWidth()));
-        p.width = m->getHeight();
-        p.height = m->getWidth();
+        segW = m->getHeight();
+        segH = m->getWidth();
     }
+    // WLED takes a 1 x N segment as one pixel long; N x 1 is the same to busPixelXY().
+    if (segW == 1 && segH > 1) {
+        std::swap(segW, segH);
+    }
+    _segments.push_back(Segment(0, segW, 0, segH));
+    p.width = segW;
+    p.height = segH;
+    isMatrix = segW > 1 && segH > 1;
     _segments[0].setMode(mode, true);
     _segments[0].speed = s;
     _segments[0].intensity = i;
@@ -726,6 +753,29 @@ uint32_t Bus::getPixelColor(int i) const {
 
     int r, g, b, wh;
     currentStrip->model->getOverlayPixelValue(x, y, r, g, b, wh);
+
+    // Undo setPixelColor()'s brightness scale, as WLED does, or effects that
+    // read pixels back apply it again each frame. Rounded up, so a pixel
+    // written back unchanged stores the same value.
+    int brightness = currentStrip->brightness;
+    if (brightness != 128) {
+        if (brightness <= 0) {
+            return 0;
+        }
+        // No divide per pixel: ARMv6 (Pi Zero) and the BBB have none in hardware.
+        static thread_local int lutBrightness = -1;
+        static thread_local uint8_t lut[256];
+        if (lutBrightness != brightness) {
+            for (int v = 0; v < 256; v++) {
+                lut[v] = std::min((v * 128 + brightness - 1) / brightness, 255);
+            }
+            lutBrightness = brightness;
+        }
+        r = lut[r & 0xFF];
+        g = lut[g & 0xFF];
+        b = lut[b & 0xFF];
+        wh = lut[wh & 0xFF];
+    }
     return (wh << 24) | (r << 16) | (g << 8) | b;
 }
 void Bus::setPixelColor(int i, uint32_t c) {

@@ -13,11 +13,14 @@
 #include "../fpp-pch.h"
 
 #include <sys/time.h>
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
 #include <cstring>
 #include <ctime>
+#include <deque>
 #include <errno.h>
 #include <mutex>
 #include <thread>
@@ -47,7 +50,9 @@ std::atomic_int LightDelay{ 50000 };
 std::atomic_int FrameSkip{ 0 };
 std::atomic_int MasterFramesPlayed{ -1 };
 std::atomic_int OutputFrames{ 1 };
-float mediaOffset = 0.0;
+// Set by every StartChannelOutputThread(), which an overlay model switched on
+// from an API thread calls too, and read on the playlist's thread.
+std::atomic<float> mediaOffset{ 0.0 };
 
 /* local variables */
 // Atomic, not volatile: volatile orders nothing between threads, and the main
@@ -63,8 +68,11 @@ std::atomic_int alwaysTransmit{ 0 };
 std::mutex outputThreadLock;
 std::recursive_mutex inlineOutputLock;
 std::mutex outputThreadStatusLock;
-// bumped under outputThreadStatusLock by every StartChannelOutputThread()
-static uint64_t outputStartRequests = 0;
+// Bumped under outputThreadStatusLock by every StartChannelOutputThread(),
+// which its callers make after setting up what they want output for (an
+// effect, an active overlay, a video).  The thread reads it at the top of each
+// pass, before it samples what needs output, and won't idle past a change.
+static std::atomic<uint64_t> outputStartRequests{ 0 };
 // Set (under outputThreadStatusLock) by StopChannelOutputThread(), which only
 // fppd's shutdown calls, and never cleared.  The teardown after it closes
 // outputs and removes overlay models, and a model state change restarts the
@@ -100,8 +108,51 @@ static double CurrentMediaClockRate(long long now) {
     return mediaClockRate.load(std::memory_order_relaxed);
 }
 
+// Media phase servo.  Media sync used to compare whole frame counts once a
+// second and leave anything within a frame alone, so the lights sat anywhere
+// up to two frames (100 ms at 20 fps) from the sound.  Now the output thread
+// publishes which frame it sends next and when that is due, each media
+// position report works out when the media says it should be due, and the
+// difference is closed a little each frame.  Whole-frame skips and holds
+// (CalculateNewChannelOutputDelayForFrame()) still handle anything larger.
+//
+// A MultiSync remote has no media of its own to follow; it holds its frames
+// to the master's sync packets the same way (UpdateMasterPosition()).
+//
+// Pending correction in us: > 0 delays the frames to come, < 0 brings them
+// forward.  The output thread takes at most kMaxPhaseStep of a period from it
+// per frame, so the cadence never visibly jumps.  It goes stale a second after
+// the media (or the master) stops reporting, like the clock rate.
+static constexpr double kMaxPhaseStep = 0.1;
+static std::atomic<long long> mediaPhaseCorrUs{ 0 };
+static std::atomic<long long> mediaPhaseCorrAt{ 0 };
+// The next frame the thread sends and when it is due, published together.
+static std::mutex nextSendLock;
+static long nextSendFrame = -1;
+static long long nextSendDueUs = 0;
+
+static void PublishNextSend(long frame, long long dueUs) {
+    std::unique_lock<std::mutex> l(nextSendLock);
+    nextSendFrame = frame;
+    nextSendDueUs = dueUs;
+}
+
+static double TakeMediaPhaseStep(long long now, double period) {
+    if (now - mediaPhaseCorrAt.load(std::memory_order_relaxed) > 1000000 || !sequence->IsSequenceRunning()) {
+        return 0.0;
+    }
+    long long pending = mediaPhaseCorrUs.load(std::memory_order_relaxed);
+    long long maxStep = (long long)(period * kMaxPhaseStep);
+    long long step = std::clamp(pending, -maxStep, maxStep);
+    if (step) {
+        mediaPhaseCorrUs.fetch_sub(step, std::memory_order_relaxed);
+    }
+    return (double)step;
+}
+
 /* prototypes for functions below */
 void CalculateNewChannelOutputDelayForFrame(int expectedFramesSent);
+static void AdjustForFrame(int expectedFramesSent, bool phaseServo);
 
 /*
  * Check to see if the channel output thread is running
@@ -110,6 +161,11 @@ int ChannelOutputThreadIsRunning(void) {
     // Acquire, not relaxed: callers wait on this for the thread's startup
     // (StartingOutput()) to have happened.  The main loop asks every pass.
     return ThreadIsRunning.load(std::memory_order_acquire);
+}
+
+static std::atomic<std::thread::id> outputThreadId{};
+bool IsChannelOutputThread(void) {
+    return outputThreadId.load(std::memory_order_relaxed) == std::this_thread::get_id();
 }
 
 int ChannelOutputThreadIsEnabled() {
@@ -139,20 +195,37 @@ void EnableChannelOutput(void) {
 // Stop Now landing within a frame of a sequence hand-over blanked the buffer
 // and nothing ever sent it: the last frame stayed lit.
 static std::atomic<uint64_t> outputForceRequests{ 0 };
+// Set with a force request by ForceChannelOutputSendNow(): the pass that picks
+// the request up sends even while output is disabled.
+static std::atomic<bool> sendWhileDisabledRequested{ false };
 
-bool ForceChannelOutputNow(void) {
-    LogDebug(VB_CHANNELOUT, "ForceChannelOutputNow()\n");
+static bool RequestForcedOutput(bool evenIfDisabled) {
     {
         std::unique_lock<std::mutex> statusLock(outputThreadStatusLock);
         if (!ThreadIsRunning || !RunThread) {
             // Not running, or on its way out: it won't send again.
             return false;
         }
-        outputForceRequests++;
+        if (evenIfDisabled) {
+            // Before the request it rides on: the thread reads it on seeing
+            // the request (acquire on outputForceRequests).
+            sendWhileDisabledRequested.store(true, std::memory_order_relaxed);
+        }
+        outputForceRequests.fetch_add(1, std::memory_order_release);
     }
     outputThreadSatusCond.notify_all();
     outputThreadCond.notify_all();
     return true;
+}
+
+bool ForceChannelOutputNow(void) {
+    LogDebug(VB_CHANNELOUT, "ForceChannelOutputNow()\n");
+    return RequestForcedOutput(false);
+}
+
+bool ForceChannelOutputSendNow(void) {
+    LogDebug(VB_CHANNELOUT, "ForceChannelOutputSendNow()\n");
+    return RequestForcedOutput(true);
 }
 
 static inline bool forceOutput() {
@@ -208,6 +281,15 @@ void RunChannelOutputThread(void) {
         // created just before shutdown stopped the output; touch nothing
         return;
     }
+    outputThreadId = std::this_thread::get_id();
+    struct ClearThreadId {
+        // Only our own id: this runs after outputThreadLock is released, by
+        // which time a replacement thread may already have stored its id.
+        ~ClearThreadId() {
+            std::thread::id self = std::this_thread::get_id();
+            outputThreadId.compare_exchange_strong(self, std::thread::id());
+        }
+    } clearThreadId;
     ThreadIsRunning = 1;
     ThreadIsExiting = 0;
     statusLock.unlock();
@@ -228,6 +310,7 @@ void RunChannelOutputThread(void) {
     }
 
     bool doForceOutput = false;
+    bool sendWhileDisabled = false;
     uint64_t forceSeen = outputForceRequests.load();
     // Every frame reads these shared values several times.  They are plain
     // values (frame number, rate, delay, on/off flags) that publish no other
@@ -242,7 +325,15 @@ void RunChannelOutputThread(void) {
         if (forceNow != forceSeen) {
             forceSeen = forceNow;
             doForceOutput = true;
+            sendWhileDisabled = sendWhileDisabledRequested.exchange(false, std::memory_order_relaxed);
         }
+        // Before forceOutput() below: what a start counted by now set up is
+        // seen there, and the idle wait catches any start counted after.
+        // Taken at the wait, it missed a start made while this pass sent and
+        // processed: the effect was set up too late for forceOutput(), the
+        // starter saw a running thread and returned, and the thread idled
+        // out under the effect.  Acquire, as for outputForceRequests.
+        const uint64_t startsSeen = outputStartRequests.load(std::memory_order_acquire);
         if (multiSync->isMultiSyncEnabled() && sequence->IsSequenceRunning()) {
             // Per-frame string copy under an uncontended leaf lock: the name is
             // short and the only writers are the open/close paths, so this costs
@@ -252,7 +343,8 @@ void RunChannelOutputThread(void) {
         }
 
         doForceOutput |= forceOutput();
-        if (OutputFrames.load(relaxed)) {
+        if (OutputFrames.load(relaxed) || sendWhileDisabled) {
+            sendWhileDisabled = false;
             if (!sequence->isDataProcessed() || sequence->hasBridgeData()) {
                 // first time through or immediately after sequence load, the data might not be
                 // processed yet, need to do it
@@ -365,17 +457,29 @@ void RunChannelOutputThread(void) {
                 // the lock, and a notify that landed before this wait began
                 // was lost - the start then spawned a replacement and this
                 // thread's timeout below cleared RunThread under it.
-                const uint64_t seenStarts = outputStartRequests;
+                // Shutdown ends the wait too: left to time out, every fppd
+                // stop took the rest of the 2.5 s.
                 if (outputThreadSatusCond.wait_for(statusLock, std::chrono::milliseconds(2500),
-                                                   [seenStarts, forceSeen]() {
-                                                       return outputStartRequests != seenStarts ||
+                                                   [startsSeen, forceSeen]() {
+                                                       return outputThreadShutDown ||
+                                                              outputStartRequests.load() != startsSeen ||
                                                               outputForceRequests.load() != forceSeen;
-                                                   })) {
+                                                   }) &&
+                    !outputThreadShutDown) {
                     // signal to keep going
                     ThreadIsExiting = 0;
                     statusLock.unlock();
                     outputThreadSatusCond.notify_all();
                     onceMore = 1;
+                    // Back from idle: the cadence starts again at this wake.
+                    // Left to the "more than a frame behind" test below, a
+                    // start within a frame of the last idle pass (a playlist's
+                    // next sequence, as the last one's blanking ends) kept the
+                    // old phase: the first frame went out at the wake and the
+                    // second at the old tick, a few ms later, and the
+                    // sequence's timing sync then slowed the next frames by up
+                    // to 15 ms each to give the lead back.
+                    nextFrameTime = 0;
                     continue;
                 } else {
                     RunThread = 0;
@@ -401,13 +505,17 @@ void RunChannelOutputThread(void) {
             nextFrameTime = startTime + lightDelay;
             frameTimeCarry = 0.0;
         } else if (startTime >= nextFrameTime) {
-            frameTimeCarry += period;
-            long long whole = (long long)frameTimeCarry;
+            frameTimeCarry += period + TakeMediaPhaseStep(startTime, period);
+            long long whole = (long long)std::floor(frameTimeCarry);
             frameTimeCarry -= whole;
             nextFrameTime += whole;
         }
         // else: a forced wake ran this pass early; the regular frame stays due
         // when it was.
+        if (sequence->IsSequenceRunning()) {
+            // The frame just read goes out at the next wake.
+            PublishNextSend((long)channelOutputFrame.load(relaxed), nextFrameTime);
+        }
         long dt = (nextFrameTime - GetMonotonicTimeMicros()) * 1000;
         if (RunThread.load(relaxed) && dt > 0) {
             if (outputThreadCond.wait_for(lock, std::chrono::nanoseconds(dt),
@@ -492,7 +600,7 @@ void StartChannelOutputThread(void) {
         } else {
             mediaOffset = 0.0;
         }
-        LogDebug(VB_MEDIAOUT, "Using mediaOffset of %.3f\n", mediaOffset);
+        LogDebug(VB_MEDIAOUT, "Using mediaOffset of %.3f\n", mediaOffset.load());
     }
 
     {
@@ -553,24 +661,20 @@ void StartChannelOutputThread(void) {
  *
  */
 int StopChannelOutputThread(void) {
-    int i = 0;
     LogDebug(VB_CHANNELOUT, "StopChannelOutputThread()\n");
 
-    // Stop the thread for good (see outputThreadShutDown) and wait a few seconds
-    {
-        std::unique_lock<std::mutex> lock(outputThreadStatusLock);
-        outputThreadShutDown = true;
-        RunThread = 0;
-    }
-    while (ThreadIsRunning && (i < 50)) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-        i++;
-    }
-
-    // Didn't stop for some reason, so it was hung somewhere
-    if (ThreadIsRunning)
+    // Stop the thread for good (see outputThreadShutDown), wake it from
+    // whichever wait it is in, and wait a few seconds for it to exit (it
+    // notifies outputThreadSatusCond once ThreadIsRunning is clear).
+    std::unique_lock<std::mutex> lock(outputThreadStatusLock);
+    outputThreadShutDown = true;
+    RunThread = 0;
+    outputThreadSatusCond.notify_all();
+    outputThreadCond.notify_all();
+    if (!outputThreadSatusCond.wait_for(lock, std::chrono::seconds(5), []() { return !ThreadIsRunning; })) {
+        // Didn't stop for some reason, so it was hung somewhere
         return -1;
-
+    }
     return 0;
 }
 
@@ -587,19 +691,103 @@ void StopForcingChannelOutput(void) {
         outputForced = 0;
 }
 
+// Where the master's recent sync packets put its frame 0 on our clock.  A
+// packet can arrive late -- the master's own loop, the network, this box's
+// scheduling -- but never early, so the earliest of the last couple of
+// seconds is the master's timeline; following each packet as it came put
+// half of every delay on the lights, frame to frame.
+static constexpr long long kMasterWindowUs = 2000000;
+struct MasterEpoch {
+    long long at;
+    double frame0Us;
+};
+static std::mutex masterEpochLock;
+static std::deque<MasterEpoch> masterEpochs;
+static int masterLastFrame = -1;
+static double masterFrameUs = 0.0;
+
 /*
  * Reset the master frames played position
  */
 void ResetMasterPosition(void) {
     MasterFramesPlayed = -1;
+    std::unique_lock<std::mutex> l(masterEpochLock);
+    masterEpochs.clear();
+}
+
+// The master's frame 0 on our clock, from the packet that put it at
+// framePosition (frameNumber rounded) arriving now, and the ones before it.
+static double MasterFrame0(int frameNumber, double framePosition, long long now, double frameUs) {
+    double frame0 = now - framePosition * frameUs;
+    std::unique_lock<std::mutex> l(masterEpochLock);
+    if (frameUs != masterFrameUs || frameNumber < masterLastFrame) {
+        // Another rate, or the master went back: a new timeline.
+        masterEpochs.clear();
+    }
+    masterFrameUs = frameUs;
+    masterLastFrame = frameNumber;
+    while (!masterEpochs.empty() && now - masterEpochs.front().at > kMasterWindowUs) {
+        masterEpochs.pop_front();
+    }
+    double best = frame0;
+    for (auto& e : masterEpochs) {
+        best = std::min(best, e.frame0Us);
+    }
+    if (frame0 - best > 3 * frameUs) {
+        // Far later than all of them: the master held or paused, or this
+        // packet is very late.  Start over from it; a late one is replaced
+        // by the next packet, and is too far off to steer by meanwhile.
+        masterEpochs.clear();
+        best = frame0;
+    }
+    masterEpochs.push_back({ now, frame0 });
+    return best;
 }
 
 /*
  * Update the count of frames that the master has played so we can sync to it
  */
 void UpdateMasterPosition(int frameNumber) {
+    UpdateMasterPosition(frameNumber, (double)frameNumber);
+}
+
+void UpdateMasterPosition(int frameNumber, double framePosition) {
     MasterFramesPlayed = frameNumber;
-    CalculateNewChannelOutputDelayForFrame(frameNumber);
+    // The master sends frame F's sync packet just before it puts F on the
+    // wire, so F goes out there about when the packet arrives (the earliest
+    // arrival of the last few, MasterFrame0()).  The frame this thread sends
+    // next is due that many frames on; the difference from when it is
+    // actually due is closed by the phase servo, as a player's lights follow
+    // its media.  Frame counts alone left a remote's lights most of a frame
+    // late at 40 fps, and one also playing the show's audio settled a
+    // different distance late each start, up to most of a frame at 20 fps.
+    //
+    // A packet comes every ten frames, so the correction left from the last
+    // one has been taken by the next; each takes half the error it measures,
+    // which closes it without overshoot.
+    bool phaseServo = false;
+    if (sequence->IsSequenceRunning() && RefreshRate > 0) {
+        long long now = GetMonotonicTimeMicros();
+        double frameUs = 1000000.0 / RefreshRate;
+        double frame0 = MasterFrame0(frameNumber, framePosition, now, frameUs);
+        long frame;
+        long long due;
+        {
+            std::unique_lock<std::mutex> l(nextSendLock);
+            frame = nextSendFrame;
+            due = nextSendDueUs;
+        }
+        if (frame >= 0 && due > 0) {
+            double ideal = frame0 + (double)frame * frameUs;
+            double err = (double)due - ideal;  // > 0: our frames are late
+            if (std::fabs(err) < 3 * frameUs) {
+                mediaPhaseCorrUs.store(llround(-0.5 * err), std::memory_order_relaxed);
+                mediaPhaseCorrAt.store(now, std::memory_order_relaxed);
+                phaseServo = true;
+            }
+        }
+    }
+    AdjustForFrame(frameNumber, phaseServo);
 }
 
 /*
@@ -608,12 +796,42 @@ void UpdateMasterPosition(int frameNumber) {
  */
 void CalculateNewChannelOutputDelay(float mediaPosition) {
     static float nextSyncCheck = 0.5;
+    static double phaseErrUs = 0.0;
+    static long long phaseErrAt = 0;
 
-    float offsetMediaPosition = mediaPosition - mediaOffset;
+    const float offset = mediaOffset;
+    float offsetMediaPosition = mediaPosition - offset;
     mediaElapsedSeconds = offsetMediaPosition < 0.0 ? 0.0 : offsetMediaPosition;
 
     if (getFPPmode() == REMOTE_MODE || !sequence->IsSequenceRunning())
         return;
+
+    // Frame F belongs on the wire when the media reaches F / RefreshRate.
+    long long now = GetMonotonicTimeMicros();
+    long frame;
+    long long due;
+    {
+        std::unique_lock<std::mutex> l(nextSendLock);
+        frame = nextSendFrame;
+        due = nextSendDueUs;
+    }
+    double frameUs = 1000000.0 / RefreshRate;
+    bool phaseServo = false;
+    if (frame >= 0 && due > 0 && offsetMediaPosition > 0.0) {
+        double rate = CurrentMediaClockRate(now);
+        double ideal = now + ((double)frame / RefreshRate - offsetMediaPosition) * 1000000.0 / rate;
+        double err = (double)due - ideal;  // > 0: the lights are late
+        if (std::fabs(err) < 3 * frameUs) {
+            // Smoothed: each report is only as good as the position query.
+            phaseErrUs = (now - phaseErrAt > 1000000) ? err : phaseErrUs + 0.2 * (err - phaseErrUs);
+            phaseErrAt = now;
+            mediaPhaseCorrUs.store(llround(-phaseErrUs), std::memory_order_relaxed);
+            mediaPhaseCorrAt.store(now, std::memory_order_relaxed);
+            phaseServo = true;
+        } else {
+            phaseErrAt = 0;
+        }
+    }
 
     if ((mediaPosition <= nextSyncCheck) &&
         (nextSyncCheck < (mediaPosition + 2.0))) {
@@ -626,16 +844,20 @@ void CalculateNewChannelOutputDelay(float mediaPosition) {
 
     LogDebug(VB_CHANNELOUT,
              "Media Position: %.2f, Offset: %.3f, Frames Sent: %d, Expected: %d, Diff: %d\n",
-             mediaPosition, mediaOffset, channelOutputFrame.load(), expectedFramesSent,
+             mediaPosition, offset, channelOutputFrame.load(), expectedFramesSent,
              channelOutputFrame - expectedFramesSent);
 
-    CalculateNewChannelOutputDelayForFrame(expectedFramesSent);
+    AdjustForFrame(expectedFramesSent, phaseServo);
 }
 
 /*
  * Calculate the new sync offset based on a desired frame number
  */
 void CalculateNewChannelOutputDelayForFrame(int expectedFramesSent) {
+    AdjustForFrame(expectedFramesSent, false);
+}
+
+static void AdjustForFrame(int expectedFramesSent, bool phaseServo) {
     int diff = channelOutputFrame - expectedFramesSent;
     bool allowFrameSkip = !multiSync->isMultiSyncEnabled();
     if (!allowFrameSkip && diff <= -(RefreshRate / 2)) {
@@ -675,6 +897,11 @@ void CalculateNewChannelOutputDelayForFrame(int expectedFramesSent) {
         }
     }
     int DefaultLightDelay = sequence->IsSequenceRunning() ? SequenceLightDelay.load() : BridgeLightDelay.load();
+    if (phaseServo && diff >= -3 && diff <= 3) {
+        // Within a few frames the phase servo has it, to well under a frame.
+        LightDelay = DefaultLightDelay;
+        return;
+    }
     if (diff > 1 || diff < -1) {
         int timerOffset = diff * (DefaultLightDelay / 100);
         int newLightDelay = LightDelay;

@@ -30,7 +30,9 @@ ServerTokens Prod
 	# Browsers send Sec-Fetch-Site only to HTTPS (and localhost) origins, so on
 	# a plain-HTTP player it is Origin, sent with every cross-origin
 	# POST/PUT/DELETE, that does the work in rule 1; rule 2 can only act on
-	# Sec-Fetch-Site and so applies only when the UI is reached over HTTPS.  Clients that are not browsers
+	# Sec-Fetch-Site and so applies only when the UI is reached over HTTPS.
+	# Over plain HTTP those GETs stay open until FPP 11 (docs/DEPRECATED.md);
+	# www/common.php marks them deprecated meanwhile.  Clients that are not browsers
 	# (xLights, other players, scripts, curl) send neither header and are not
 	# affected, and a page served by this player is "same-origin" -- also
 	# when another player's UI reaches it through /proxy/, which forwards
@@ -44,22 +46,47 @@ ServerTokens Prod
 	RewriteEngine On
 
 	# 1. Anything but GET/HEAD/OPTIONS that another site's page sent.
+	#    An Origin that names the host a reverse proxy was asked for
+	#    (X-Forwarded-Host) is this UI too: an older player's /proxy/ passes
+	#    the browser's Origin -- that player -- on unchanged, and without
+	#    this every POST control of this player's UI seen through it was
+	#    refused.  A page on another site cannot add that
+	#    header: a custom header needs a CORS preflight, and nothing here
+	#    allows it (Access-Control-Allow-Headers is Content-Type only).
 	RewriteCond %{ENV:REDIRECT_STATUS} ^$
 	RewriteCond %{REQUEST_URI} !^/(json|win|ws)(/|$)
 	RewriteCond %{REQUEST_METHOD} !^(GET|HEAD|OPTIONS)$
-	RewriteCond expr "%{HTTP:Sec-Fetch-Site} -in {'cross-site', 'same-site'} || (%{HTTP:Sec-Fetch-Site} == '' && %{HTTP:Origin} != '' && %{HTTP:Origin} != 'http://' . %{HTTP_HOST} && %{HTTP:Origin} != 'https://' . %{HTTP_HOST})"
+	RewriteCond expr "%{HTTP:Sec-Fetch-Site} -in {'cross-site', 'same-site'} || (%{HTTP:Sec-Fetch-Site} == '' && %{HTTP:Origin} != '' && %{HTTP:Origin} != 'http://' . %{HTTP_HOST} && %{HTTP:Origin} != 'https://' . %{HTTP_HOST} && %{HTTP:Origin} != 'http://' . %{HTTP:X-Forwarded-Host} && %{HTTP:Origin} != 'https://' . %{HTTP:X-Forwarded-Host})"
 	RewriteRule ^ - [F]
 
 	# 2. GETs that act rather than read, when another site's page sent them
 	#    (a link, an <img>, a fetch).  Reading stays open cross-origin.
 	#    Only effective over HTTPS (see above): over plain HTTP these routes
-	#    stay reachable until they stop answering GET.  Keep this list in
+	#    stay reachable until they stop answering GET in FPP 11.  Keep this
+	#    list, and the copy in www/common.php that marks them deprecated, in
 	#    step with any GET route that changes state.
 	RewriteCond %{ENV:REDIRECT_STATUS} ^$
 	RewriteCond %{HTTP:Sec-Fetch-Site} ^(cross-site|same-site)$ [NC]
 	RewriteCond %{REQUEST_URI} ^(/proxy/[^/]+)?/api/(index\.php|api\.php|command/|events/[^/]+/trigger|file/move/|git/reset|network/interface/add/|playlists/(stop|pause|resume|stopgracefully|stopgracefullyafterloop)$|playlist/[^/]+/start|playlist/repeat/|plugin/[^/]+/upgrade|sequence/current/(stop|togglePause)|sequence/[^/]+/start/|scripts/[^/]+/run|system/(reboot|shutdown)$|system/fppd/(start|stop|restart)$) [NC,OR]
 	RewriteCond %{REQUEST_URI} ^/(changebranch|copystorage|disableKiosk|flash-storage|formatstorage|gitCheckoutVersion|growsd|installKiosk|manualUpdate|newpartitionsd|packagesHelper|rebootRemoteFPP|rebuildfpp|resetConfig|restartRemoteFPPD|run_mp3gain|runEventScript|shutdownRemoteFPP|upgradeCapeFirmware|upgradefpp|upgradeOS)\.php$ [NC]
 	RewriteRule ^ - [F]
+
+	# A plugin's own assets: /js/plugin/<plugin>/<file>, and the same under
+	# /css/plugin/ and /images/plugin/, are handed to plugin.php, which serves
+	# the file from the plugin's directory.  There are no such directories
+	# under www/, and must not need to be: a <Directory> section only applies
+	# to a directory that exists, so rules kept in one never ran for a path
+	# that is only a URL, and every plugin script and stylesheet 404d.
+	#
+	# Split on the FIRST slash after the plugin name: the plugin name is one
+	# path component and everything after it is the file, which may sit in a
+	# subdirectory (images/foo.png).  A greedy split handed plugin.php a
+	# plugin of "myplugin/images", and its name allow-list rejects the slash.
+	# PT, so the rewritten /plugin.php is mapped (and password-protected) like
+	# any other page.
+	RewriteRule ^/(js|css|images)/plugin/([^/]+)/(.+)$ /plugin.php?plugin=$2&file=$3&nopage=1 [NC,QSA,B,PT,L,E=FPP_PLUGIN_ASSET:1]
+	Header always set Access-Control-Allow-Origin "*" env=FPP_PLUGIN_ASSET
+	Header always set Access-Control-Allow-Methods "GET,POST,OPTIONS,DELETE,PUT" env=FPP_PLUGIN_ASSET
 
 	DocumentRoot /opt/fpp/www
 
@@ -71,7 +98,13 @@ ServerTokens Prod
 	<Directory /opt/fpp/www/>
 		Options Indexes FollowSymLinks
 		AllowOverride None
-     Require local
+     # Local, but not by way of /proxy/: proxied back to this player's own
+     # address, a request arrives from the server's address, which "Require
+     # local" counts as local -- and so skipped the UI password.
+     <RequireAll>
+       Require local
+       Require expr "%{HTTP:X-FPP-Proxied} == ''"
+     </RequireAll>
 
     # Equivalent to 'Satisfy Any'
     # Apache 2.4 uses logical OR when multiple Require directives are present
@@ -205,73 +238,37 @@ ProxyPassReverse /api/http-virtual-display/ http://localhost:32328/
 ProxyPass /fppdws ws://localhost:32322/fppdws
 ProxyPassReverse /fppdws ws://localhost:32322/fppdws
 
-<Directory "/opt/fpp/www/js/plugin">
-    Options FollowSymLinks
-    AllowOverride None
-
-    # Enable rewriting
-    RewriteEngine On
-
-    # Split on the FIRST slash only: the plugin name is one path component and
-    # everything after it is the file, which may sit in a subdirectory
-    # (images/foo.png). A greedy '^(.*)/(.*)$' handed plugin.php a plugin of
-    # "myplugin/images", and its name allow-list rejects the slash, so every
-    # nested plugin asset 404d.
-    RewriteRule ^([^/]+)/(.+)$ /plugin.php?plugin=$1&file=$2&nopage=1 [NC,L,QSA,B]
-
-    # CORS headers
-    Header always set Access-Control-Allow-Origin "*"
-    Header always set Access-Control-Allow-Methods "GET,POST,OPTIONS,DELETE,PUT"
+# The media directory's virtualdisplay_assets is linked into the web root and
+# is writable through the file API (/api/file/virtualdisplay_assets/...), so a
+# PHP file put there would run as the web server: assets only, no scripts.
+# Nor in the browser: an uploaded .html or .svg opened from here would run its
+# script with this player's origin and full use of its API.  The sandbox only
+# applies to a document opened from here; the 3D view's fetches and image
+# loads of these files are unaffected.
+<Directory ~ "^(/opt/fpp/www|/home/fpp/media)/virtualdisplay_assets">
+    <FilesMatch "\.(ph(ar|p[0-9]?|t|tml)|phps)$">
+        Require all denied
+    </FilesMatch>
+    # Inside <If>, which is merged after every <Files>/<FilesMatch> section:
+    # set directly here, the server-wide mod_headers rules further down, which
+    # unset Content-Security-Policy for .rss, .atom, .rdf, .txt, .json and
+    # others, ran after it and took the sandbox off those -- and browsers
+    # render the XML ones, script and all.
+    <If "true">
+        Header always set Content-Security-Policy "sandbox"
+    </If>
 </Directory>
 
 <Directory "/opt/fpp/www/localonly">
     Options FollowSymLinks
     AllowOverride None
 
-    # Restrict access to local requests only
-    Require local
-</Directory>
-
-<Directory "/opt/fpp/www/css/plugin">
-    Options FollowSymLinks
-    AllowOverride None
-
-    # Enable mod_rewrite
-    RewriteEngine On
-
-    # Split on the FIRST slash only: the plugin name is one path component and
-    # everything after it is the file, which may sit in a subdirectory
-    # (images/foo.png). A greedy '^(.*)/(.*)$' handed plugin.php a plugin of
-    # "myplugin/images", and its name allow-list rejects the slash, so every
-    # nested plugin asset 404d.
-    RewriteRule ^([^/]+)/(.+)$ /plugin.php?plugin=$1&file=$2&nopage=1 [NC,L,QSA,B]
-
-    # CORS headers
-    Header always set Access-Control-Allow-Origin "*"
-    Header always set Access-Control-Allow-Methods "GET,POST,OPTIONS,DELETE,PUT"
-</Directory>
-
-# This directory must exist or none of the below applies: Apache only merges a
-# <Directory> section for a directory that is actually there, so a missing one
-# means the rewrite never runs and every plugin image 404s silently. It holds no
-# files - see www/images/plugin/.gitkeep, which exists to keep it in the tree.
-<Directory "/opt/fpp/www/images/plugin">
-    Options FollowSymLinks
-    AllowOverride None
-
-    # Enable mod_rewrite
-    RewriteEngine On
-
-    # Split on the FIRST slash only: the plugin name is one path component and
-    # everything after it is the file, which may sit in a subdirectory
-    # (images/foo.png). A greedy '^(.*)/(.*)$' handed plugin.php a plugin of
-    # "myplugin/images", and its name allow-list rejects the slash, so every
-    # nested plugin asset 404d.
-    RewriteRule ^([^/]+)/(.+)$ /plugin.php?plugin=$1&file=$2&nopage=1 [NC,L,QSA,B]
-
-    # CORS headers
-    Header always set Access-Control-Allow-Origin "*"
-    Header always set Access-Control-Allow-Methods "GET,POST,OPTIONS,DELETE,PUT"
+    # Restrict access to local requests only (not ones /proxy/ sent back
+    # to this player's own address; see /opt/fpp/www/ above)
+    <RequireAll>
+      Require local
+      Require expr "%{HTTP:X-FPP-Proxied} == ''"
+    </RequireAll>
 </Directory>
 
 
@@ -324,6 +321,17 @@ ProxyPassReverse /fppdws ws://localhost:32322/fppdws
     # on, its Origin (this player) would not match the next player's Host, so
     # that player's gate would refuse this player's own UI.
     RequestHeader unset Origin
+    # Marks what /proxy forwards.  Proxied back to this player's own
+    # address, a request arrives from the server's own address, which
+    # "Require local" counts as local; the local exemptions below and in the
+    # UI password config refuse a request carrying this, so /proxy/<own IP>/
+    # cannot skip the password.  A client cannot use it to gain anything:
+    # it only ever takes the local exemption away.  Not set for a client that
+    # is itself on loopback (a kiosk browser at http://localhost): it was
+    # local already, and its UI lists this player by its LAN address, so its
+    # own proxied requests would otherwise ask it for a password it never
+    # gave.  A mark an earlier hop set is passed on all the same.
+    RequestHeader set X-FPP-Proxied 1 "expr=! -R '127.0.0.0/8' && ! -R '::1/128'"
 
     # Expand gzip only for clients that cannot decode it themselves; everything
     # else is passed through exactly as the controller sent it.
@@ -674,8 +682,15 @@ AddDefaultCharset utf-8
         # though the server is serving the new file correctly. Ctrl+F5 is the
         # only way out, which is exactly the trap the note above set out to
         # avoid.
+        #
+        # The separator goes with it. And when PHP set its own Cache-Control
+        # (the file-backed /api routes send no-cache), the merge above added
+        # `immutable` as a second Cache-Control header rather than to PHP's,
+        # and taking the word out of it left an empty one: the two went out
+        # as "Cache-Control: no-cache, ". An emptied header is dropped.
         <FilesMatch "\.(appcache|css|cur|geojson|m?js|json(ld)?|php|x?html?|topojson|xml)$">
-            Header edit Cache-Control immutable ""
+            Header edit Cache-Control "\s*,?\s*\bimmutable\b" ""
+            Header unset Cache-Control "expr=-z resp('Cache-Control')"
         </FilesMatch>
 
         # 3) And remove it from anything that says max-age=0, whatever it is

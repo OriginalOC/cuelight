@@ -102,7 +102,13 @@ void StreamSlotManager::SetActiveOutput(int slot, GStreamerOutput* output) {
         m_slots[slot - 1].mediaFilename = output->m_mediaFilename;
         LogDebug(VB_MEDIAOUT, "StreamSlotManager: slot %d active (%s)\n", slot,
                 output->m_mediaFilename.c_str());
-        int saved = savedStreamSlotVolume(slot);
+        // A volume set while the slot was idle is newer than the saved one
+        // (and is all there is when it came from a command, not the mixer).
+        int saved = m_slots[slot - 1].pendingVolume;
+        m_slots[slot - 1].pendingVolume = -1;
+        if (saved < 0) {
+            saved = savedStreamSlotVolume(slot);
+        }
         if (saved >= 0) {
             output->SetVolume(saved);
             LogDebug(VB_MEDIAOUT, "StreamSlotManager: restored slot %d volume to %d%%\n", slot, saved);
@@ -138,12 +144,33 @@ GStreamerOutput* StreamSlotManager::GetActiveOutput(int slot) {
     return m_slots[slot - 1].activeOutput;
 }
 
+void StreamSlotManager::ClaimSlot(int slot, GStreamerOutput* output) {
+    if (slot < 1 || slot > MAX_SLOTS) return;
+    std::lock_guard<std::recursive_mutex> lock(m_mutex);
+    m_slots[slot - 1].claimedBy = output;
+}
+
 void StreamSlotManager::ClearSlot(int slot, GStreamerOutput* owner) {
     if (slot < 1 || slot > MAX_SLOTS) return;
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     bool closing = owner && m_slots[slot - 1].closingOutput == owner;
     if (closing) {
         m_slots[slot - 1].closingOutput = nullptr;
+    }
+    GStreamerOutput* claimedBy = m_slots[slot - 1].claimedBy;
+    if (owner && claimedBy && claimedBy != owner) {
+        // A newer stream has started on this slot (ClaimSlot) and may already
+        // have written its status -- its duration, say -- though it has not
+        // registered yet: leave the slot to it.  Only our own registration,
+        // if it is somehow still there, goes.
+        if (m_slots[slot - 1].activeOutput == owner) {
+            m_slots[slot - 1].activeOutput = nullptr;
+        }
+        LogDebug(VB_MEDIAOUT, "StreamSlotManager: slot %d clear skipped, claimed by a newer stream\n", slot);
+        return;
+    }
+    if (!owner || claimedBy == owner) {
+        m_slots[slot - 1].claimedBy = nullptr;
     }
     if (owner && m_slots[slot - 1].activeOutput != owner &&
         !(closing && !m_slots[slot - 1].activeOutput)) {
@@ -163,6 +190,7 @@ void StreamSlotManager::ClearSlot(int slot, GStreamerOutput* owner) {
     // numbers behind makes a freshly started stream read as though it were
     // already minutes in until its first Process() lands.  Slot 1 aliases the
     // global mediaOutputStatus, which is not ours to wipe.
+    std::lock_guard<std::mutex> fieldsLock(MediaOutputStatus::FieldsLock());
     if (slot > 1) {
         m_slots[slot - 1].status = {};
     }
@@ -192,17 +220,25 @@ std::string StreamSlotManager::GetVideoNodeDescription(int slot) {
     return "FPP Video Stream " + std::to_string(slot);
 }
 
-bool StreamSlotManager::SetSlotVolume(int slot, int volume) {
+bool StreamSlotManager::SetSlotVolume(int slot, int volume, bool* deferred) {
 #ifdef HAS_GSTREAMER
     if (slot < 1 || slot > MAX_SLOTS) return false;
     std::lock_guard<std::recursive_mutex> lock(m_mutex);
     GStreamerOutput* output = m_slots[slot - 1].activeOutput;
     if (output) {
         output->SetVolume(volume);
-        return true;
+    } else {
+        // Nothing to apply it to yet: the slot's next stream starts at it,
+        // as it does at the level the mixer saves.
+        m_slots[slot - 1].pendingVolume = volume;
     }
-#endif
+    if (deferred) {
+        *deferred = !output;
+    }
+    return true;
+#else
     return false;
+#endif
 }
 
 bool StreamSlotManager::SeekSlot(int slot, float seconds) {
@@ -236,6 +272,7 @@ Json::Value StreamSlotManager::GetAllSlotsStatus() {
                                 : (i == 0)                         ? &mediaOutputStatus
                                                                    : &m_slots[i].status;
         if (out) {
+            std::lock_guard<std::mutex> fieldsLock(MediaOutputStatus::FieldsLock());
             slotJson["status"] = "playing";
             slotJson["mediaFilename"] = m_slots[i].mediaFilename;
             slotJson["secondsElapsed"] = st->secondsElapsed;
@@ -326,7 +363,12 @@ void StreamSlotManager::SyncSlotsToMaster(float masterPos) {
         // flush seek, which moves the position enough to feed the next
         // correction -- measured 0.9-2.5s oscillating, never converging, on
         // streams that were exactly locked before the "sync" was applied.
-        float drift = m_slots[i].status.mediaSeconds - masterPos;
+        float slotPos;
+        {
+            std::lock_guard<std::mutex> fieldsLock(MediaOutputStatus::FieldsLock());
+            slotPos = m_slots[i].status.mediaSeconds;
+        }
+        float drift = slotPos - masterPos;
         if (drift > -MAX_DRIFT_SEC && drift < MAX_DRIFT_SEC)
             continue;
         LogInfo(VB_MEDIAOUT, "StreamSlotManager: slot %d drifted %0.3fs from the primary, seeking to %0.3f\n",

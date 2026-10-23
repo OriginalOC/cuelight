@@ -39,6 +39,7 @@
 
 #include "common.h"
 #include "log.h"
+#include "mediaoutput.h"
 #include "settings.h"
 
 // ──────────────────────────────────────────────────────────────────────────────
@@ -46,6 +47,15 @@
 // ──────────────────────────────────────────────────────────────────────────────
 static OpusRTPManager s_opusRTPManager;
 OpusRTPManager& OpusRTPManager::INSTANCE = s_opusRTPManager;
+
+// Set a send pipeline's master volume element (see SetMasterVolume()).
+static void SetPipelineMasterVolume(GstElement* pipeline, int volume) {
+    GstElement* vol = gst_bin_get_by_name(GST_BIN(pipeline), "mastervol");
+    if (vol) {
+        g_object_set(vol, "volume", masterVolumeGain(volume), nullptr);
+        gst_object_unref(vol);
+    }
+}
 
 OpusRTPManager::OpusRTPManager() {
     m_configPath = getFPPMediaDir("/config/pipewire-opus-rtp-instances.json");
@@ -335,6 +345,7 @@ bool OpusRTPManager::ApplyConfigLocked() {
     std::map<int, std::string> deferred;
     bool sendFailed = false;
     bool recvFailed = false;
+    int failedStarts = 0;
 
     for (const auto& inst : m_config.instances) {
         if (!inst.enabled) continue;
@@ -357,11 +368,13 @@ bool OpusRTPManager::ApplyConfigLocked() {
                     "Waiting for audio — not a member of any enabled Audio Output Group";
             } else if (!CreateSendPipeline(inst)) {
                 sendFailed = true;
+                failedStarts++;
             }
         }
 
         if (wantRecv && !CreateRecvPipeline(inst)) {
             recvFailed = true;
+            failedStarts++;
         }
     }
     ClearOpusPipelineWarnings(!sendFailed, !recvFailed);
@@ -369,6 +382,7 @@ bool OpusRTPManager::ApplyConfigLocked() {
     {
         std::lock_guard<std::mutex> lock(m_pipelineMutex);
         m_deferredSenders = std::move(deferred);
+        m_failedStarts = failedStarts;
     }
 
     // Start watchdog thread
@@ -512,6 +526,8 @@ bool OpusRTPManager::CreateSendPipeline(const OpusRTPInstance& inst) {
         << "! audioconvert "
         << "! audioresample "
         << "! audioconvert "
+        // The master volume (see SetMasterVolume()).
+        << "! volume name=mastervol volume=" << masterVolumeGain(getVolume()) << " "
         << "! audiorate "
         << "! audio/x-raw,rate=" << OpusRTP::AUDIO_RATE
         << ",channels=" << inst.channels << " "
@@ -566,6 +582,14 @@ bool OpusRTPManager::CreateSendPipeline(const OpusRTPInstance& inst) {
         gst_object_unref(pwsrc);
     }
 
+    // On the system clock, not pipewiresrc's GstPipeWireClock, which stops
+    // advancing for a follower stream once the graph's real driver takes it
+    // over; pipewiresrc waits on it before every buffer, and the sender went
+    // quiet after its first packets.  Same as RTSPOutputManager's audio bridge.
+    GstClock* sysClock = gst_system_clock_obtain();
+    gst_pipeline_use_clock(GST_PIPELINE(pipeline), sysClock);
+    gst_object_unref(sysClock);
+
     GstBus* bus = gst_pipeline_get_bus(GST_PIPELINE(pipeline));
 
     GstStateChangeReturn ret = gst_element_set_state(pipeline, GST_STATE_PLAYING);
@@ -605,6 +629,9 @@ bool OpusRTPManager::CreateSendPipeline(const OpusRTPInstance& inst) {
         it->second.pipeline = pipeline;
         it->second.bus = bus;
         it->second.running = true;
+        // The gain in the description is the one when it was built; a change
+        // since then went to the pipelines already in this map, not this one.
+        SetPipelineMasterVolume(pipeline, getVolume());
     }
 
     LogInfo(VB_MEDIAOUT, "Opus RTP send pipeline [%d] %s started -> %s:%d (%dch, %d kbps%s)\n",
@@ -794,6 +821,15 @@ static GstPadProbeReturn OpusDropBufferProbe(GstPad* pad, GstPadProbeInfo* info,
     return GST_PAD_PROBE_DROP;
 }
 
+void OpusRTPManager::SetMasterVolume(int volume) {
+    std::lock_guard<std::mutex> lock(m_pipelineMutex);
+    for (auto& kv : m_sendPipelines) {
+        if (kv.second.pipeline) {
+            SetPipelineMasterVolume(kv.second.pipeline, volume);
+        }
+    }
+}
+
 void OpusRTPManager::FlushSendPipelines() {
     std::lock_guard<std::mutex> lock(m_pipelineMutex);
     for (auto& kv : m_sendPipelines) {
@@ -954,6 +990,27 @@ bool OpusRTPManager::PollPipelinesWatchdog() {
 
     checkPipelines(m_sendPipelines, "send");
     checkPipelines(m_recvPipelines, "recv");
+
+    // A stream that failed to start is never stored, so nothing above sees
+    // it.  The first retry is this pass; one that keeps failing waits 30s,
+    // 60s, ... up to 8 minutes, and the count starts over after 10 quiet
+    // minutes.
+    if (m_failedStarts > 0) {
+        const auto now = std::chrono::steady_clock::now();
+        if (m_failedStartRebuilds > 0 && now - m_lastFailedStartRebuild > std::chrono::minutes(10)) {
+            m_failedStartRebuilds = 0;
+        }
+        const auto wait = std::chrono::seconds(30) * (1 << std::min(std::max(m_failedStartRebuilds - 1, 0), 4));
+        if (needsRebuild || m_failedStartRebuilds == 0 || now - m_lastFailedStartRebuild >= wait) {
+            if (!needsRebuild) {
+                m_failedStartRebuilds++;
+                m_lastFailedStartRebuild = now;
+            }
+            needsRebuild = true;
+            LogWarn(VB_MEDIAOUT, "Opus RTP watchdog: %d stream(s) failed to start, trying again\n",
+                    m_failedStarts);
+        }
+    }
 
     return needsRebuild;
 }

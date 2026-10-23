@@ -1051,20 +1051,25 @@ function processRestoreData($restore_area, $restore_area_data, $backup_version)
 
                 //COMMAND PRESET RESTORE
                 if ($restore_areas_idx == "commandPresets") {
-                    $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                    //Get the restore data out of the array.  A backup that carries no
+                    //presets -- made on a player that had none, where the section is
+                    //[null], or by hand without it -- has nothing to restore here:
+                    //json_encode() of its absence wrote "null" over this player's
+                    //presets.  As with the proxies, ATTEMPT only when there is data.
+                    $restore_data = isset($restore_area_data['commandPresets'][0]) ? $restore_area_data['commandPresets'][0] : null;
+                    if (is_array($restore_data)) {
+                        $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
 
-                    //Get the restore data out of the array
-                    $restore_data = $restore_area_data['commandPresets'][0];
+                        //Generate the filepath for the config file to be restored
+                        $commandPresets_filepath = $settings['configDirectory'] . "/commandPresets.json";
 
-                    //Generate the filepath for the config file to be restored
-                    $commandPresets_filepath = $settings['configDirectory'] . "/commandPresets.json";
-
-                    //PrettyPrint the JSON data and save it
-                    $commandPresets_data_restore = prettyPrintJSON(json_encode($restore_data));
-                    if (file_put_contents($commandPresets_filepath, $commandPresets_data_restore) === false) {
-                        $save_result = false;
-                    } else {
-                        $save_result = true;
+                        //PrettyPrint the JSON data and save it
+                        $commandPresets_data_restore = prettyPrintJSON(json_encode($restore_data));
+                        if (file_put_contents($commandPresets_filepath, $commandPresets_data_restore) === false) {
+                            $save_result = false;
+                        } else {
+                            $save_result = true;
+                        }
                     }
                 }
 
@@ -1177,7 +1182,7 @@ function processRestoreData($restore_area, $restore_area_data, $backup_version)
                 //TIMEZONE RESTORATION
                 if ($restore_areas_idx == "timezone") {
                     //get data out of nested array
-                    $restore_data = $restore_area_data['timezone'][0];
+                    $restore_data = isset($restore_area_data['timezone'][0]) ? $restore_area_data['timezone'][0] : null;
 
                     //Make sure we have an array, there will be 2 indexes, 0 the timezone and 1 a linebreak
                     if (is_array($restore_data) || !is_null($restore_data)) {
@@ -1209,17 +1214,22 @@ function processRestoreData($restore_area, $restore_area_data, $backup_version)
 
                 //PROXY CONFIG RESTORATION
                 if ($restore_areas_idx == "proxies") {
-                    $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                    //Get the restore data out of the array.  A backup with no proxies
+                    //section (one made by hand, or before proxies were backed up) has
+                    //nothing to restore here: implode() on its absence was a fatal that
+                    //took every later sub-area of the restore with it.  As with the
+                    //plugin privacy record, ATTEMPT is only set when there is data.
+                    $restore_data = isset($restore_area_data['proxies'][0]) ? $restore_area_data['proxies'][0] : null;
+                    if (is_array($restore_data)) {
+                        $settings_restored[$restore_area_key][$restore_areas_idx]['ATTEMPT'] = true;
+                        $data = implode("\n", $restore_data);
 
-                    //Get the restore data out of the array
-                    $restore_data = $restore_area_data['proxies'][0];
-                    $data = implode("\n", $restore_data);
-
-                    //This is a standard file with webserver config, just write it out
-                    if (file_put_contents($settings['configDirectory'] . "/proxies", $data) === false) {
-                        $save_result = false;
-                    } else {
-                        $save_result = true;
+                        //This is a standard file with webserver config, just write it out
+                        if (file_put_contents($settings['configDirectory'] . "/proxies", $data) === false) {
+                            $save_result = false;
+                        } else {
+                            $save_result = true;
+                        }
                     }
                 }
 
@@ -2150,7 +2160,8 @@ function doBackupDownload($settings_data, $area)
                 $backup_local_fpath,
                 isset($settings_data['backup_comment']) ? $settings_data['backup_comment'] : '',
                 isset($settings_data['backup_trigger_source']) ? $settings_data['backup_trigger_source'] : null,
-                $backup_blob_refs
+                $backup_blob_refs,
+                isset($settings_data['backup_taken']) ? $settings_data['backup_taken'] : null
             );
 
             //Once the backup has been written into our local directory, prune/remove any backups older than the max set age
@@ -2313,8 +2324,10 @@ function retrievePluginList()
                 $plugin_name = explode(".", $fname);
                 $plugin_name = $plugin_name[1];
 
-                //Store config file locations here
-                $locations = array();
+                //Store config file locations here.  plugin.X and plugin.X.json
+                //both map to X, so add to the plugin's entry rather than replacing
+                //it: replacing kept whichever file readdir returned last.
+                $locations = isset($plugin_names[$plugin_name]) ? $plugin_names[$plugin_name]['location'] : array();
                 //Normal Plugin config file location
                 $locations[$fname] = ($settings['configDirectory'] . "/" . $fname);
                 //                //Check the extra backup locations where the plugin name matches this plugin and extra the extra path
@@ -2669,7 +2682,8 @@ if ($skipHTMLCodeOutput === false) {
                 showCompressed: '.sendCompressed',
                 popupModalId: 'copyPopup_Modal',
                 popupCloseBtnId: 'copyPopup_ModalCloseButton',
-                copyPopupBodyId: 'copyPopup'
+                copyPopupBodyId: 'copyPopup',
+                copyButton: '#backupCopyBtn'
             };
 
             function BackupDirectionChanged() {
@@ -2716,10 +2730,14 @@ if ($skipHTMLCodeOutput === false) {
             }
 
             function GetBackupHostBackupDirs(remoteStorageSelected) {
-                fppFileCopy.getBackupHostBackupDirs(remoteStorageSelected);
+                // The Backup Host select passes its setting name. A new host
+                // means new storage choices, and reloading them lists the
+                // folders too.
                 if (remoteStorageSelected === 'backup.Host') {
                     GetRemoteHostUSBStorage();
+                    return;
                 }
+                fppFileCopy.getBackupHostBackupDirs(remoteStorageSelected);
             }
 
             function PopulateBackupDirs(data, excludeRoot) {
@@ -2798,7 +2816,7 @@ if ($skipHTMLCodeOutput === false) {
                 var direction = document.getElementById("backup.Direction").value;
                 var flags = GetCopyFlags();
 
-                var url = "copystorage.php?wrapped=1&direction=" + direction;
+                var url = "copystorage.php?wrapped=1&feed=" + fppFileCopy.newFeedId() + "&direction=" + direction;
 
                 // Substite back in case we changed \ to /
                 document.getElementById("backup.Path").value = path;
@@ -2897,7 +2915,7 @@ if ($skipHTMLCodeOutput === false) {
                 $('#copyPopup_ModalCloseButton').prop('disabled', true).text('Please Wait');
                 $('#copyText').val('');
 
-                StreamURL(url, 'copyText', 'CopyDone', 'CopyTimeoutError');
+                StreamURL(url, 'copyText', 'CopyDone', 'CopyTimeoutError', 'POST');
 
             }
 
@@ -2973,7 +2991,7 @@ if ($skipHTMLCodeOutput === false) {
 
                 $.ajax({
                     url: url,
-                    type: 'GET',
+                    type: 'POST',
                     success: function (data) {
                         $.jGrowl('JSON Configuration Backups copied to: ' + selected_jsonConfigBackupUSBLocation, { themeState: 'success' });
                     },
@@ -3233,8 +3251,8 @@ if ($skipHTMLCodeOutput === false) {
                 //Add the loading spinner
                 $('#backup\\.RemoteStorage').parent().closest('td').addClass('fpp-backup-action-loading');
 
-                //Write setting to system
-                $.ajax({
+                //Write setting to system (Copy waits for it and the folder lookup it starts)
+                fppFileCopy.trackLookup($.ajax({
                     url: 'api/settings/backup.RemoteStorage/',
                     type: 'PUT',
                     data: value,
@@ -3252,51 +3270,42 @@ if ($skipHTMLCodeOutput === false) {
                         //remove the spinner
                         $('#backup\\.RemoteStorage').parent().closest('td').removeClass('fpp-backup-action-loading');
                     }
-                });
+                }));
             }
 
-            //Get the current setting for the remote hosts remote backup storage device (where the file copy will go to)
+            //Select the remote storage device saved for the File Copy again once the host's devices are loaded.
+            //Copy stays disabled until this has finished, so it can't go to the wrong device.
             function GetBackupRemoteStorageDevice() {
-                //Add a the loading spinner to show something is happening
-                $('#backup\\.RemoteStorage').parent().closest('div').addClass('fpp-backup-action-loading');
+                var storageSelect = $('#backup\\.RemoteStorage');
+                var shown = storageSelect.val();
+                storageSelect.parent().find('.remoteStorageWarning').remove();
 
-                $.ajax({
+                fppFileCopy.trackLookup($.ajax({
                     url: 'api/settings/backup.RemoteStorage',
                     type: 'GET',
                     success: function (data) {
-                        if (data.value !== "" && data.value !== 'undefined' && typeof (data.value) !== "undefined") {
-                            //Check if the chosen USB device/location exists in the dropdown list
-                            //The USB device dropdown list only lists devices which are available for use, so if the chosen device is not in the list
-                            //it's likely unavailable or still mounted (as such not available for use)
-                            var remote_storage_ddl_selector = $('#backup\\.RemoteStorage option[value="' + data.value + '"]');
-                            if (remote_storage_ddl_selector.length) {
-                                //Change the JSON Config backup location to the one set by the user if a valid value is set
-                                remote_storage_ddl_selector.attr('selected', true);
+                        var saved = (typeof (data.value) === 'string') ? data.value : '';
+                        //A device the user picked while this was loading wins (and is already saved)
+                        if (saved !== '' && storageSelect.val() === shown) {
+                            //The list only has devices the host can use, so a missing one is unplugged or mounted elsewhere
+                            if (storageSelect.find('option').filter(function () { return this.value === saved; }).length) {
+                                storageSelect.val(saved);
                             } else {
                                 var host = document.getElementById("backup.Host").value;
-                                $('#backup\\.RemoteStorage').parent().append("<span> <b>Warning:</b> " + data.value + " is not available. Check device is attached to host and that is not currently mounted. Check <a href='http://" + host + "/settings.php#settings-storage' target='_blank'>" + host + " - Mounted USB Devices</a></span>");
-                            }
-                            //
-                            $('#backup\\.RemoteStorage').parent().closest('div').removeClass('fpp-backup-action-loading');
-
-                            //Get the backup directories avaiable on the selected storage device if were restoring from remote,
-                            if (document.getElementById("backup.Direction").value == 'FROMREMOTE') {
-                                //If no Remote Storage device is selected don't pass anything to this function telling it to look at another device
-                                //so we just get what is on the default FPP storage device
-                                var selectedStorage = encodeURIComponent($('#backup\\.RemoteStorage').val());
-
-                                GetBackupHostBackupDirs(selectedStorage);
+                                storageSelect.parent().append("<span class='remoteStorageWarning'> <b>Warning:</b> " + EscapeHtml(saved) + " is not available. Check device is attached to host and that is not currently mounted. Check <a href='http://" + EscapeHtmlAttr(host) + "/settings.php#settings-storage' target='_blank'>" + EscapeHtml(host) + " - Mounted USB Devices</a></span>");
                             }
                         }
                     },
-                    error: function (data) {
-                        //do nothing
+                    error: function () {
                         DialogError('Remote Host Backup Storage Location', 'Failed to read remote storage location.');
-
-                        $('#backup\\.RemoteStorage').parent().closest('div').removeClass('fpp-backup-action-loading');
                     }
-                });
+                }).always(function () {
+                    //List the folders on whatever ended up selected (only done for a copy from the remote)
+                    GetBackupHostBackupDirs(storageSelect.val());
+                }));
             }
+
+            fppFileCopy.config.onRemoteStorageLoaded = GetBackupRemoteStorageDevice;
 
 
 
@@ -3812,7 +3821,7 @@ if ($skipHTMLCodeOutput === false) {
                                             <tr>
                                                 <td></td>
                                                 <td>
-                                                    <input type='button' class="buttons" value="Copy"
+                                                    <input type='button' id='backupCopyBtn' class="buttons" value="Copy"
                                                         onClick="PerformCopy();">
                                         </table>
 

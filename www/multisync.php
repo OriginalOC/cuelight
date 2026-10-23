@@ -251,6 +251,12 @@
         // Reading the live DOM from a setTimeout (poll tick) turns out to be
         // unreliable — the DOM may appear reverted by the time the tick fires.
         var _reorderCommittedOrder = null;
+        // True while a reorder grip is held. A render then pulls the row out from
+        // under jQuery UI sortable: a poll landing between mousedown and the drag
+        // starting made it throw creating its drag helper, and the row never moved.
+        // The patched initBody() defers such a render until the grip is released.
+        var _reorderGripHeld = false;
+        var _reorderRenderDeferred = false;
 
         var channelOutputConfigCache = {};
         var channelInputConfigCache = {};
@@ -411,24 +417,28 @@
         }
 
         function ipLink(ip) {
+            // Escaped: besides fppd's own list, this also renders the addresses a
+            // remote reports for itself (advancedView.IPs).
+            var e = msEscape(ip);
             if (fppConfig.hideExternalURLs) {
-                return ip;
+                return e;
             }
-            return "<a target='host_" + ip + "' href='" + wrapUrlWithProxy(ip, "/") + "' data-ip='" + ip + "'>" + ip + "</a>";
+            return "<a target='host_" + e + "' href='" + msEscape(wrapUrlWithProxy(ip, "/")) + "' data-ip='" + e + "'>" + e + "</a>";
         }
 
         // Build the wifi signal-strength icon span from an interface's wifi object.
         function buildWifiIconHtml(w) {
+            // Every field comes from the remote's status, so all of it is escaped.
             var h = ['<span title="'];
             if (w.pct) {
-                h.push(w.pct + '%');
+                h.push(msEscape(w.pct) + '%');
                 if (w.unit == 'dBm') {
-                    h.push(' ' + w.level + 'dBm');
+                    h.push(' ' + msEscape(w.level) + 'dBm');
                 }
             } else {
-                h.push(w.level + w.unit);
+                h.push(msEscape(w.level) + msEscape(w.unit));
             }
-            h.push('" class="wifi-icon wifi-', w.desc, '"></span>');
+            h.push('" class="wifi-icon wifi-', msEscape(w.desc), '"></span>');
             return h.join('');
         }
 
@@ -543,7 +553,10 @@
          *
          *   3. CHECKS — the row action checkboxes (.multisyncRowCheckbox) are
          *               generated as static HTML strings without a "checked" attr.
-         *               initBody() rebuilds them all unchecked.
+         *               initBody() rebuilds them all unchecked.  Handled in the
+         *               patched initBody() inside parseFPPSystems(), not here:
+         *               bootstrap-table's own renders (the filter-control search)
+         *               don't come through this function.
          *
          *               The per-remote unicast checkboxes (.syncCheckbox) are NOT
          *               handled here.  Their state is persisted config, not
@@ -555,16 +568,15 @@
          *
          * HOW IT WORKS
          * ------------
-         * Before calling origInitBody():
-         *   a. Snapshot every checked checkbox (keyed by name=IP).
-         *   b. If reorder mode is active, sync bt.options.data to the current DOM
+         * Before calling initBody():
+         *   a. If reorder mode is active, sync bt.options.data to the current DOM
          *      row order so the re-render preserves what the user dragged.
-         *   c. Record the focused element's id and value (only if it is inside the
+         *   b. Record the focused element's id and value (only if it is inside the
          *      filter-control row; other focus contexts are intentionally left alone).
          *
-         * After calling origInitBody():
-         *   d. Restore checked state on the freshly rendered checkboxes.
-         *   e. Re-focus the saved element and restore its value.
+         * After calling initBody():
+         *   c. Re-apply the drag order, which initBody() may have re-sorted.
+         *   d. Re-focus the saved element and restore its value.
          *
          * WHEN TO USE
          * -----------
@@ -584,14 +596,7 @@
             var bt = $tbl.data('bootstrap.table');
             if (!bt) return;
 
-            // (a) Snapshot checked action-checkboxes by IP/name so we can restore
-            //     them after initBody() rebuilds the rows from static HTML.
-            var checkedNames = {};
-            $tbl.find('input.multisyncRowCheckbox').each(function () {
-                if (this.checked) checkedNames[this.name] = true;
-            });
-
-            // (b) In reorder mode, use the order captured synchronously in the jQuery
+            // (a) In reorder mode, use the order captured synchronously in the jQuery
             //     UI sortable 'stop' callback (_reorderCommittedOrder).  This is more
             //     reliable than reading the live DOM here, because by the time this
             //     setTimeout-based poll tick fires the browser's DOM can appear to have
@@ -610,7 +615,7 @@
                 bt.options.sortOrder = undefined;
             }
 
-            // (c) Record the focused element's id and value if it lives inside a
+            // (b) Record the focused element's id and value if it lives inside a
             //     filter-control cell.  Other focus contexts (buttons, inputs in
             //     modals, etc.) are intentionally ignored.
             var focusedId = null;
@@ -623,7 +628,7 @@
 
             bt.initBody();
 
-            // (d) Re-apply the user's drag order if we are in reorder mode.
+            // (c) Re-apply the user's drag order if we are in reorder mode.
             //     initBody() may have re-sorted rows; we move them back to the
             //     position the user dragged them to.  Each system row is moved with
             //     its immediately-following child rows (warnings / logs) so that they
@@ -644,16 +649,7 @@
                 });
             }
 
-            // (f) Restore checked state on freshly rebuilt checkbox nodes.
-            //     (.syncCheckbox is handled by applyUnicastCheckboxes() — see the
-            //     CHECKS note in this function's header comment.)
-            if (Object.keys(checkedNames).length) {
-                $tbl.find('input.multisyncRowCheckbox').each(function () {
-                    if (checkedNames[this.name]) this.checked = true;
-                });
-            }
-
-            // (g) Re-focus the filter element and restore its value.
+            // (d) Re-focus the filter element and restore its value.
             if (focusedId) {
                 var el = document.getElementById(focusedId);
                 if (el) {
@@ -1202,6 +1198,20 @@
             }
         }
 
+        // Runs the render deferred while a reorder grip was held (see
+        // _reorderGripHeld), once sortable's own mouseup handling -- whose 'stop'
+        // records the order that render has to keep -- has run.
+        function releaseReorderGrip() {
+            if (!_reorderGripHeld) return;
+            _reorderGripHeld = false;
+            setTimeout(function () {
+                if (_reorderRenderDeferred && !_reorderGripHeld) {
+                    _reorderRenderDeferred = false;
+                    safeInitBody($('#fppSystemsTable'));
+                }
+            }, 0);
+        }
+
         /**
          * Toggles reorder mode on/off.
          * When enabled: adds drag handles, enables jQuery UI sortable on tbody,
@@ -1223,6 +1233,12 @@
                 $table.find('th').css('pointer-events', 'none');
                 // Disable filter inputs
                 $table.find('.filter-control input, .filter-control select').prop('disabled', true);
+
+                $tbody.on('mousedown.fppReorder touchstart.fppReorder', '.reorder-grip', function () {
+                    _reorderGripHeld = true;
+                });
+                $(document).on('mouseup.fppReorder touchend.fppReorder touchcancel.fppReorder', releaseReorderGrip);
+                $(window).on('blur.fppReorder', releaseReorderGrip);
 
                 // Enable jQuery UI sortable on tbody
                 $tbody.sortable({
@@ -1265,6 +1281,10 @@
                 if ($tbody.sortable('instance')) {
                     $tbody.sortable('destroy');
                 }
+                $tbody.off('.fppReorder');
+                $(document).off('.fppReorder');
+                $(window).off('.fppReorder');
+                releaseReorderGrip();
 
                 // Re-enable header click sorting
                 $table.find('th').css('pointer-events', '');
@@ -1718,7 +1738,7 @@
                                     elapsed = data.time_elapsed;
                             }
                         } else {
-                            status = data.status_name;
+                            status = msEscape(data.status_name);
                         }
                         if (data.status_name != 'unreachable') {
                             unavailables[ip] = 0;
@@ -1806,7 +1826,8 @@
 
                         if (item._dataIp !== ip) item._dataIp = ip;
 
-                        item.elapsed = elapsed;
+                        // time_elapsed is the remote's own string; nothing above escapes it.
+                        item.elapsed = msEscape(elapsed);
 
                         if (data.warnings != null && data.warnings.length > 0) {
                             $('#' + rowID + '_warnings').removeAttr('style');
@@ -1990,7 +2011,11 @@
                                         var uf = formatUptime(uptimeSec);
                                         u += "<tr><td><small class='text-muted'>UP:</small></td><td>";
                                         u += '<span title="since ' + uf.since + '">' + uf.short + '</span>';
-                                        u += ' <span data-bs-html="true" title="<span class=\'tooltipSpan\'>' + diskHtml + '<br><b>Since:</b> ' + uf.since + '</span>">...</span>';
+                                        // An HTML tooltip whose markup rides in title="...": the
+                                        // browser decodes one level when it parses the attribute,
+                                        // so the finished markup is escaped once more (diskHtml
+                                        // holds the remote's own disk names, escaped as content).
+                                        u += ' <span data-bs-html="true" title="' + msEscape("<span class='tooltipSpan'>" + diskHtml + '<br><b>Since:</b> ' + uf.since + '</span>') + '">...</span>';
                                         u += "</td></tr>";
                                     }
                                 }
@@ -2007,6 +2032,7 @@
                                 var changed = false;
                                 var extra = item._extraIpHtml || '';
                                 data.advancedView.IPs.forEach(function(avIp) {
+                                    if (typeof avIp !== 'string') return;
                                     // Skip addresses not reachable from the browser: IPv4 APIPA
                                     // (169.254/16, no DHCP lease), IPv6 link-local (fe80::/10, the
                                     // zone id is host-specific), and loopback (127.x / ::1).
@@ -2028,6 +2054,9 @@
                     });
             safeInitBody($('#fppSystemsTable'));
             SetupToolTips();
+            } catch (e) {
+                // fppd busy or unreachable for a moment; the next tick retries.
+                console.warn('FPP system status poll failed', e);
             } finally {
                 if (Array.isArray(ipAddresses) && $('#MultiSyncRefreshStatus').is(":checked") && !isUserInteracting()) {
                     fppPoller.schedule(() => getFPPSystemStatus(ipAddresses, true));
@@ -2045,6 +2074,7 @@
             // Destroy Bootstrap Table before manipulating DOM so destroy
             // doesn't restore a stale snapshot over our new rows
             var $tbl = $('#fppSystemsTable');
+            disposeRowPopups($('#fppSystems'));
             if ($tbl.closest('.bootstrap-table').length) {
                 $tbl.bootstrapTable('destroy');
             }
@@ -2527,6 +2557,10 @@
             if (bt) {
                 var origInitBody = bt.initBody;
                 bt.initBody = function (fixedScroll, updatedUid) {
+                    if (_reorderGripHeld) {
+                        _reorderRenderDeferred = true;
+                        return;
+                    }
                     var $body = this.$el.find('>tbody');
                     // Capture log <textarea> scroll positions BEFORE detaching the
                     // child rows.  Detaching an element from the DOM destroys its
@@ -2542,7 +2576,24 @@
                         scrollState[this.id] = { top: this.scrollTop, atBottom: atBottom };
                     });
                     var $childRows = $liveChildRows.detach();
+                    disposeRowPopups($body);
+                    // The row action checkboxes are static HTML with no "checked"
+                    // attr, so a render rebuilds them unchecked.  Not every render
+                    // comes from safeInitBody(): the filter-control extension runs
+                    // a column search 500 ms after it builds its controls (every
+                    // 'load', show/hide column) and on each filter keystroke, and
+                    // that re-renders straight through here.  A row checked in
+                    // that window, or before typing in a filter, was cleared.
+                    var checkedNames = {};
+                    $body.find('input.multisyncRowCheckbox').each(function () {
+                        if (this.checked) checkedNames[this.name] = true;
+                    });
                     origInitBody.call(this, fixedScroll, updatedUid);
+                    if (Object.keys(checkedNames).length) {
+                        $tbl.find('input.multisyncRowCheckbox').each(function () {
+                            if (checkedNames[this.name]) this.checked = true;
+                        });
+                    }
                     // Every render — the initial 'load' and every poll-driven
                     // safeInitBody() — funnels through here, so this is the one
                     // place the unicast checkboxes need re-applying.
@@ -2568,6 +2619,21 @@
             reattachChildRows($tbl, $detachedChildren);
 
             if (typeof buildColumnSelector === 'function') buildColumnSelector();
+        }
+
+        /**
+         * Dispose the Bootstrap tooltips and popovers inside rows that are about
+         * to be thrown away.  Bootstrap holds every instance in a global Map keyed
+         * by its element until dispose(), so a row replaced without this stays in
+         * memory -- and with it the whole detached tbody -- on every poll.
+         * Covers instances SetupToolTips() made as well as the lazily created
+         * .ms-play-tip tooltips and channel I/O popovers.
+         */
+        function disposeRowPopups($scope) {
+            $scope.find('*').each(function () {
+                bootstrap.Tooltip.getInstance(this)?.dispose();
+                bootstrap.Popover.getInstance(this)?.dispose();
+            });
         }
 
         /**
@@ -2777,7 +2843,17 @@
                     open.send("XJ");
                 }
             } else {
-                var ws = new WebSocket(wsProxyUrl(ip, "/ws"));
+                // This runs while parseFPPSystems() is still building the
+                // table, so a throw here (a browser refusing the URL, or one it
+                // cannot parse) would unwind the render and leave every row
+                // out.  One device's probe failing leaves just its status blank.
+                var ws;
+                try {
+                    ws = new WebSocket(wsProxyUrl(ip, "/ws"));
+                } catch (err) {
+                    console.log("Could not open the ESPixelStick socket for " + ip + ": " + err);
+                    return;
+                }
                 ESPSockets[ips] = ws;
 
                 ws.binaryType = "arraybuffer";
@@ -2855,9 +2931,9 @@
                         if (!item) return;
 
                         var u = "<table class='multiSyncVerboseTable'>";
-                        u += "<tr><td>Uptime:</td><td>" + data['u'] + "</td></tr>";
-                        u += "<tr><td>V1 Voltage:</td><td> " + data['v1'] + "</td></tr>";
-                        u += "<tr><td>V2 Voltage:</td><td> " + data['v2'] + "</td></tr>";
+                        u += "<tr><td>Uptime:</td><td>" + msEscape(data['u']) + "</td></tr>";
+                        u += "<tr><td>V1 Voltage:</td><td> " + msEscape(data['v1']) + "</td></tr>";
+                        u += "<tr><td>V2 Voltage:</td><td> " + msEscape(data['v2']) + "</td></tr>";
                         u += "</table>";
 
                         item.utilization = u;
@@ -2908,7 +2984,7 @@
                         if (!item) return;
 
                         item.utilization = u;
-                        item.status = s.status_name;
+                        item.status = (s.status_name == null) ? s.status_name : msEscape(s.status_name);
 
                         if (testmode == true || overtemp == true) {
                             $('#' + rowId + '_warnings').removeAttr('style');
@@ -3145,6 +3221,62 @@
             baldrickPoller.cancel();
         }
 
+        // The pollers above only refresh the status of rows already in the
+        // table; the system list itself (api/fppd/multiSyncSystems) was read
+        // once, by getFPPSystems() at page load.  So a system joining the
+        // network never appeared until the page was reloaded.  This re-reads
+        // the list on a slower cadence and rebuilds the table when fppd knows
+        // an address the table doesn't.
+        const discoveryPoller = new AutoRefreshController(15000);
+
+        /**
+         * A rebuild goes through parseFPPSystems(), which recreates the table
+         * from scratch: row checkboxes, filters and open update logs would be
+         * lost.  While any of those is in use the rebuild waits for a later
+         * check rather than throw the user's work away.
+         */
+        function systemListRebuildBlocked() {
+            if (streamCount || isUserInteracting()) return true;
+            if ($('#fppSystems input.multisyncRowCheckbox:checked').length) return true;
+            if ($('#fppSystems > tr.logRow:visible').length) return true;
+            var $filters = $('#fppSystemsTable').closest('.bootstrap-table')
+                .find('.filter-control input, .filter-control select');
+            return $filters.filter(function () { return this.value !== ''; }).length > 0;
+        }
+
+        async function checkForNewSystems() {
+            try {
+                const r = await fetch('api/fppd/multiSyncSystems');
+                if (!r.ok) {
+                    throw new Error("HTTP " + r.status);
+                }
+                const data = await r.json();
+                if (!data || !Array.isArray(data.systems)) return;
+                var known = {};
+                systemsList.forEach(function (s) { known[s.address] = true; });
+                var added = data.systems.some(function (s) {
+                    return s.address && !known[s.address];
+                });
+                if (added && !systemListRebuildBlocked()) {
+                    data.systems.forEach(foldSystemInfo);
+                    systemsList = data.systems;
+                    parseFPPSystems(data.systems);
+                }
+            } catch (e) {
+                console.warn('System list check failed', e);
+            } finally {
+                scheduleSystemDiscovery();
+            }
+        }
+
+        function scheduleSystemDiscovery() {
+            if ($('#MultiSyncRefreshStatus').is(":checked")) {
+                discoveryPoller.schedule(checkForNewSystems);
+            } else {
+                discoveryPoller.cancel();
+            }
+        }
+
         function RefreshStats() {
             var $tbl = $('#fppSystemsTable');
             var ips = [], gips = [], wips = [], bips = [], fv3ips = [], fv4ips = [];
@@ -3198,6 +3330,7 @@
             if ($('#MultiSyncRefreshStatus').is(":checked")) {
                 RefreshStats();
             }
+            scheduleSystemDiscovery();
         }
 
         function syncModeUpdated(setting = '') {
@@ -3695,7 +3828,7 @@
                 const q = quickStreamQueue.shift();
                 quickStreamActive++;
                 StreamURL(q.url, q.rowID + '_logText', settle(actionDone),
-                    settle(function (id) { actionFailed(id, q.url); }));
+                    settle(function (id) { actionFailed(id, q.url); }), 'POST');
             }
         }
 
@@ -4124,8 +4257,11 @@
             try {
                 const r = await fetch("api/settings/MultiSyncRemotes", {
                     method: 'PUT',
-                    body: JSON.stringify(remotes),
-                    headers: { 'Content-Type': 'application/json' }
+                    // The raw list, not JSON.stringify(): the API stores the body as
+                    // given, and the quotes a JSON string adds became part of the
+                    // value, which fppd then read as part of the first and last IPs.
+                    body: remotes,
+                    headers: { 'Content-Type': 'text/plain' }
                 });
                 if (!r.ok) throw new Error(r.status);
                 settings['MultiSyncRemotes'] = remotes;
@@ -4356,7 +4492,7 @@
                             <button id='exportStatsButton' type='button' class='buttons' value='Export'
                                 onClick='exportMultisync();'><i class="fas fa-scroll"></i> Export </button>
                             <button id='refreshStatsButton' type='button' class='buttons' value='Refresh Stats'
-                                onClick='clearRefreshTimers(); RefreshStats();'><i class="fas fa-redo"></i> Refresh
+                                onClick='clearRefreshTimers(); RefreshStats(); checkForNewSystems();'><i class="fas fa-redo"></i> Refresh
                                 Stats</button>
                             <div class="ms-2">
                             </div>

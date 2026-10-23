@@ -69,12 +69,14 @@ dispatch_post('/email/test', 'SendTestEmail');
 dispatch_get('/events', 'events_list');
 dispatch_get('/events/:eventId', 'event_get');
 dispatch_get('/events/:eventId/trigger', 'event_trigger');
+dispatch_post('/events/:eventId/trigger', 'event_trigger');
 
 dispatch_get('/files/Sequences/fps', 'GetSequenceFPS'); // keep above files/:DirName
 dispatch_get('/files/:DirName', 'GetFiles');
 dispatch_get('/file/info/:plugin/:ext/**', 'GetPluginFileInfo'); // keep above file/:DirName
 dispatch_get('/file/onUpload/:ext/**', 'PluginFileOnUpload'); // keep above file/:DirName
 dispatch_get('/file/move/:fileName', 'MoveFile'); // keep above file/:DirName
+dispatch_post('/file/move/:fileName', 'MoveFile'); // keep above file/:DirName/:Name
 dispatch_get('/files/zip/:DirNames', 'GetZipDir');
 dispatch_post('/file/:DirName/copy/:source/:dest', 'files_copy');
 dispatch_post('/file/:DirName/rename/:source/:dest', 'files_rename');
@@ -90,6 +92,7 @@ dispatch_get('/git/releases/os/:All', 'GitOSReleases');
 dispatch_get('/git/releases/notes/:tag', 'GitOSReleaseNotes');
 dispatch_get('/git/releases/sizes', 'GitOSReleaseSizes');
 dispatch_get('/git/reset', 'GitReset');
+dispatch_post('/git/reset', 'GitReset');
 dispatch_get('/git/status', 'GitStatus');
 dispatch_get('/git/branches', 'GitBranches');
 dispatch_get('/git/forkBranches', 'GitForkBranches');
@@ -108,6 +111,10 @@ dispatch_get('/network/interface/:interface', 'network_get_interface');
 dispatch_get('/network/interface/add/:interface', 'network_add_interface');
 dispatch_post('/network/interface/:interface', 'network_set_interface');
 dispatch_post('/network/interface/:interface/apply', 'network_apply_interface');
+// Below the generic POST: limonade compiles ':param' to an optional group, so
+// above it this would also take POST /network/interface/add (an interface
+// named "add").  The GET forms are in the same order.
+dispatch_post('/network/interface/add/:interface', 'network_add_interface');
 dispatch_delete('/network/interface/:interface', 'network_delete_interface');
 
 dispatch_delete('/network/presisentNames', 'network_persistentNames_delete');
@@ -226,6 +233,11 @@ dispatch_get('/playlists/pause', 'playlist_pause');
 dispatch_get('/playlists/resume', 'playlist_resume');
 dispatch_get('/playlists/stopgracefully', 'playlist_stopgracefully');
 dispatch_get('/playlists/stopgracefullyafterloop', 'playlist_stopgracefullyafterloop');
+dispatch_post('/playlists/stop', 'playlist_stop');
+dispatch_post('/playlists/pause', 'playlist_pause');
+dispatch_post('/playlists/resume', 'playlist_resume');
+dispatch_post('/playlists/stopgracefully', 'playlist_stopgracefully');
+dispatch_post('/playlists/stopgracefullyafterloop', 'playlist_stopgracefullyafterloop');
 dispatch_get('/playlist/:PlaylistName', 'playlist_get');
 dispatch_get('/playlist/:PlaylistName/start', 'playlist_start');
 dispatch_get('/playlist/:PlaylistName/start/:Repeat', 'playlist_start_repeat');
@@ -233,6 +245,13 @@ dispatch_get('/playlist/:PlaylistName/start/:Repeat/:ScheduleProtected', 'playli
 dispatch_post('/playlist/:PlaylistName', 'playlist_update');
 dispatch_delete('/playlist/:PlaylistName', 'playlist_delete');
 dispatch_post('/playlist/:PlaylistName/:SectionName/item', 'PlaylistSectionInsertItem');
+// The POST starts go below the routes above, as their GETs do: limonade
+// compiles ':param' to an optional group, so registered first
+// '/playlist/:PlaylistName/start' also took POST /playlist/start (saving a
+// playlist named "start", in any case) and the item insert into one.
+dispatch_post('/playlist/:PlaylistName/start', 'playlist_start');
+dispatch_post('/playlist/:PlaylistName/start/:Repeat', 'playlist_start_repeat');
+dispatch_post('/playlist/:PlaylistName/start/:Repeat/:ScheduleProtected', 'playlist_start_repeat_protected');
 // Must stay BELOW the /playlist/:PlaylistName routes.  limonade compiles a
 // trailing ':param' to an OPTIONAL group, so this pattern also matches the
 // two-segment '/playlist/repeat' and '/playlist/repeat/start' - registered
@@ -240,6 +259,7 @@ dispatch_post('/playlist/:PlaylistName/:SectionName/item', 'PlaylistSectionInser
 // "repeat".  Below them, only a genuine '/playlist/repeat/<value>' (which no
 // earlier route matches) reaches it.
 dispatch_get('/playlist/repeat/:Repeat', 'playlist_repeat');
+dispatch_post('/playlist/repeat/:Repeat', 'playlist_repeat');
 
 dispatch_get('/plugin/headerIndicators', 'GetPluginHeaderIndicators');
 dispatch_get('/plugin', 'GetInstalledPlugins');
@@ -275,6 +295,7 @@ dispatch_get(array('/proxy/*/**', array("Ip", "urlPart")), 'GetProxiedURL');
 
 dispatch_get('/remotes', 'GetRemotes');
 dispatch_get('/remoteAction', 'remoteAction');
+dispatch_post('/remoteAction', 'remoteAction');
 
 dispatch_get('/geoip', 'GetGeoIP');
 
@@ -282,6 +303,8 @@ dispatch_get('/sequence', 'GetSequences');
 dispatch_get('/sequence/current/step', 'GetSequenceStep');
 dispatch_get('/sequence/current/stop', 'GetSequenceStop');
 dispatch_get('/sequence/current/togglePause', 'GetSequenceTogglePause');
+dispatch_post('/sequence/current/stop', 'GetSequenceStop');
+dispatch_post('/sequence/current/togglePause', 'GetSequenceTogglePause');
 // SequenceName is matched with the Limonade '**' wildcard segment (rather
 // than ':SequenceName') so it can contain '/' and resolve subdirectory-
 // qualified names like "halloween/halloween-chase". The explicit names
@@ -290,17 +313,19 @@ dispatch_get('/sequence/current/togglePause', 'GetSequenceTogglePause');
 // would, so params('SequenceName') in sequence.php is unchanged.
 //
 // '**' is greedy (regex `(.*)`), so the more specific /meta and /start
-// routes MUST be registered before the bare download route below --
+// routes, and the literal /current/stop and /current/togglePause routes
+// above, MUST be registered before the bare download route below --
 // Limonade's route_find() tries routes in registration order and the first
 // pattern that matches wins; the bare route's wildcard would otherwise
-// swallow "/sequence/<name>/meta" and "/sequence/<name>/start/<n>" paths
-// before they ever reached their intended handlers. Verified with
-// route_find() directly against this exact route table (GET/POST/DELETE,
-// multi-segment and flat names, plus the existing /sequence/current/* and
-// bare /sequence literal routes) before deploying.
+// swallow "/sequence/<name>/meta", "/sequence/<name>/start/<n>", and
+// "/sequence/current/..." paths before they ever reached their intended
+// handlers. Verified with route_find() directly against this exact route
+// table (GET/POST/DELETE, multi-segment and flat names, plus the existing
+// /sequence/current/* and bare /sequence literal routes) before deploying.
 dispatch_get(array('/sequence/**/meta', array(0 => 'SequenceName')), 'GetSequenceMetaData');
 dispatch_get(array('/sequence/**/start/:startSecond', array(0 => 'SequenceName')), 'GetSequenceStart');
 dispatch_get(array('/sequence/**', array(0 => 'SequenceName')), 'GetSequence');
+dispatch_post(array('/sequence/**/start/:startSecond', array(0 => 'SequenceName')), 'GetSequenceStart');
 dispatch_post(array('/sequence/**', array(0 => 'SequenceName')), 'PostSequence');
 dispatch_delete(array('/sequence/**', array(0 => 'SequenceName')), 'DeleteSequences');
 
@@ -319,6 +344,7 @@ dispatch_get('/scripts', 'scripts_list');
 dispatch_get('/scripts/:scriptName', 'script_get');
 dispatch_post('/scripts/:scriptName', 'script_save');
 dispatch_get('/scripts/:scriptName/run', 'script_run');
+dispatch_post('/scripts/:scriptName/run', 'script_run');
 
 dispatch_get('/statistics/usage', 'stats_get_last_file');
 dispatch_post('/statistics/usage', 'stats_publish_stats_file');
@@ -327,11 +353,16 @@ dispatch_delete('/statistics/usage', 'stats_delete_last_file');
 dispatch_get('/system/fppd/restart', 'RestartFPPD');
 dispatch_get('/system/fppd/start', 'StartFPPD');
 dispatch_get('/system/fppd/stop', 'StopFPPD');
+dispatch_post('/system/fppd/restart', 'RestartFPPD');
+dispatch_post('/system/fppd/start', 'StartFPPD');
+dispatch_post('/system/fppd/stop', 'StopFPPD');
 dispatch_get('/system/fppd/restartStatus', 'GetFPPDRestartStatus');
 dispatch_post('/system/fppd/skipBootDelay', 'SkipBootDelay');
 dispatch_get('/system/reboot', 'RebootDevice');
+dispatch_post('/system/reboot', 'RebootDevice');
 dispatch_get('/system/releaseNotes/:version', 'ViewReleaseNotes');
 dispatch_get('/system/shutdown', 'SystemShutdownOS');
+dispatch_post('/system/shutdown', 'SystemShutdownOS');
 dispatch_get('/system/status', 'SystemGetStatus');
 dispatch_get('/system/updateStatus', 'GetUpdateStatus');
 dispatch_get('/system/updateActivity', 'GetUpdateActivity');

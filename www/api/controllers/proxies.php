@@ -5,10 +5,15 @@ require_once(__DIR__ . "/../../config.php");
  * Proxy a command to remote FPP
  *
  * Proxies a named action to a remote FPP instance by IP address.
- * Supported actions: `listUpgrades`, `reboot`, `restartFppd`, `upgradeOS`,
- * `updateLog` (the remote's running FPP/OS update, with its log tail).
+ * Supported actions: `listUpgrades`, `reboot`, `restartFppd`, `updateLog`
+ * (the remote's running FPP/OS update, with its log tail). `reboot` and
+ * `restartFppd` change the remote: send them by POST, which FPP 11 will
+ * require of them. The others read and stay GETs. An OS upgrade of another
+ * player is a MultiSync job (`streamRemoteJobs.php`, type `upgradeOS`), which
+ * streams its progress.
  *
  * @route GET /api/remoteAction
+ * @route POST /api/remoteAction
  * @response 400 Invalid action
  * ```json
  * {"error": "Invalid action given: badaction"}
@@ -24,14 +29,15 @@ function remoteAction()
         'listUpgrades' => '/api/git/releases/os',
         'reboot' => '/api/system/reboot',
         'restartFppd' => '/api/system/fppd/restart',
-        'upgradeOS' => '/upgradeOS',
         'updateLog' => '/api/system/updateActivity?logTail=1&lines=300',
     ];
 
-    if (!filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4)) {
+    // Another player, never this one: 127.0.0.1 reached this player's own
+    // local-only pages (Apache counts a request from itself as local).
+    $ipLong = filter_var($ip, FILTER_VALIDATE_IP, FILTER_FLAG_IPV4) ? ip2long($ip) : false;
+    if ($ipLong === false || ($ipLong & 0xFF000000) == 0x7F000000 || $ipLong == 0) {
         http_response_code(400);
-        echo json_encode(['error' => "Invalid IP address: $ip"]);
-        exit(0);
+        return json(['error' => "Invalid IP address: $ip"]);
     }
 
     if (!array_key_exists($action, $action_map)) {
@@ -39,27 +45,39 @@ function remoteAction()
         return json(['error' => 'HTTP Error: 400', 'details' => "Invalid action given: $action"]);
     }
 
-    $curl = curl_init('http://' . $ip . $action_map[$action]);
-    curl_setopt($curl, CURLOPT_FAILONERROR, true);
-    curl_setopt($curl, CURLOPT_FOLLOWLOCATION, true);
-    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
-    curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 2000);
-    $request_content = curl_exec($curl);
-    $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
-    if ($http_code !== 200) {
+    if (in_array($action, array('reboot', 'restartFppd'), true)) {
+        $request_content = RemotePlayerAction('http://' . $ip . $action_map[$action], 2000, $http_code);
+    } else {
+        $curl = curl_init('http://' . $ip . $action_map[$action]);
+        curl_setopt($curl, CURLOPT_FAILONERROR, true);
+        // Redirects are not followed: the remote would decide what this player
+        // fetches, and a Location of http://127.0.0.1/... reaches this player's
+        // own local-only pages, which the IP check above exists to keep out.
+        // No player redirects any of these paths.
+        curl_setopt($curl, CURLOPT_FOLLOWLOCATION, false);
+        curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($curl, CURLOPT_CONNECTTIMEOUT_MS, 2000);
+        $request_content = curl_exec($curl);
+        $http_code = curl_getinfo($curl, CURLINFO_HTTP_CODE);
         curl_close($curl);
+    }
+    if ($http_code !== 200) {
         http_response_code($http_code);
         $details = $request_content ? $request_content : 'No response content';
-        if ($http_code < 200) {
-            $details = curl_error($curl);
-        }
         http_response_code(400);
         return json(['error' => 'HTTP Error: ' . $http_code, 'details' => $request_content]);
     }
-    curl_close($curl);
 
-    return($request_content);
-
+    // The answer is the remote's, not this player's: never hand it back as
+    // the page (limonade's default text/html), where a host answering with
+    // markup would run script on this player's origin. Every action here
+    // answers JSON; anything else (an old player's plain-text reboot reply)
+    // goes back as a JSON string.
+    $decoded = json_decode($request_content);
+    if (json_last_error() !== JSON_ERROR_NONE) {
+        $decoded = ['response' => $request_content];
+    }
+    return json($decoded, JSON_HEX_TAG | JSON_HEX_AMP);
 }
 
 /**

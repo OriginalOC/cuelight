@@ -12,6 +12,8 @@
 
 #include "fpp-pch.h"
 
+#include <shared_mutex>
+
 #include "fpp-json.h"
 
 #include <dlfcn.h>
@@ -41,6 +43,7 @@
 #include "../Plugins.h"
 #include "../config.h"
 #include "../MultiSync.h"
+#include "../e131bridge.h"
 
 #include "processors/OutputProcessor.h"
 
@@ -97,16 +100,23 @@ bool HasChannelOutputs() {
     return channelOutputs.load() != nullptr;
 }
 
-// NOTE: this and GetOutputTypes() below walk the list from HTTP/MultiSync
-// threads without outputThreadLock, so they can still read an instance the
-// reload path is freeing.  Taking the lock here is NOT safe: the output thread
-// holds it across Sequence::SendSequenceData(), which runs FSEQ-triggered
-// commands (Sequence.cpp), and a command that reaches back into either of
-// these would deadlock the output thread outright.  Closing this properly
-// wants a read-side that cannot block the writer -- an RCU/epoch scheme or a
-// shared_ptr snapshot of the list -- rather than this mutex.
+// This and GetOutputTypes() below walk the list from HTTP/MultiSync threads.
+// They can't take outputThreadLock: the output thread holds it across
+// Sequence::SendSequenceData(), which runs FSEQ-triggered commands, and a
+// command that reached back into either of these would deadlock the output
+// thread.  They read under outputListFreeLock instead, which the reload path
+// takes last, only while it unlinks instances, and which these walks hold
+// alone -- a leaf, so nothing can wait on it in a cycle.  Without it they
+// could read an instance the reload was freeing.  The reload frees what it
+// unlinked only after letting go: an output's Close() takes other locks
+// (UDPOutput's removes its NetworkMonitor callback, whose dispatch takes
+// MultiSync's lock, which is held around these walks), and the walk that
+// could still see an unlinked instance is one the exclusive lock waited out.
+static std::shared_mutex outputListFreeLock;
+
 bool HasUniverseOutputs() {
     std::string universeFile = FPP_DIR_CONFIG("/co-universes.json");
+    std::shared_lock<std::shared_mutex> l(outputListFreeLock);
     for (auto inst = channelOutputs.load(); inst != nullptr; inst = inst->next) {
         if (inst->sourceFile == universeFile) {
             return true;
@@ -287,6 +297,7 @@ static void ComputeOutputRanges() {
     }
     preciseOutputRanges.store(std::make_shared<const OutputRangeVec>(std::move(precise)));
     outputRanges.store(std::make_shared<const OutputRangeVec>(std::move(normal)));
+    Bridge_OutputRangesChanged();
     MultiSync::INSTANCE.Ping();
     MultiSync::INSTANCE.WriteRuntimeInfoFile();
 }
@@ -361,6 +372,8 @@ static bool ReloadChannelOutputsForFile(const std::string& cfgFile) {
         // And against a blank being sent inline from another thread (see
         // inlineOutputLock); that send doesn't hold outputThreadLock.
         std::unique_lock<std::recursive_mutex> inlineLock(inlineOutputLock);
+        // and against HasUniverseOutputs()/GetOutputTypes(); see there
+        std::unique_lock<std::shared_mutex> freeLock(outputListFreeLock);
         for (auto inst = channelOutputs.load(); inst != nullptr; inst = inst->next) {
             // remove everything in the list that was loaded from the cfgFile
             if (inst->sourceFile == cfgFile) {
@@ -380,6 +393,9 @@ static bool ReloadChannelOutputsForFile(const std::string& cfgFile) {
                 }
             }
         }
+        // Unlinked: no walk under it can reach these any more.  Let go before
+        // closing them -- see HasUniverseOutputs().
+        freeLock.unlock();
         if (ChannelOutputThreadIsRunning()) {
             // StoppingOutput() is the pair of the StartingOutput() the output
             // thread makes when it comes up, so it is only owed to the outputs
@@ -474,6 +490,11 @@ static bool ReloadChannelOutputsForFile(const std::string& cfgFile) {
             }
 
             try {
+                // the output's constructor raises warnings too, not just Init()
+                struct ConfigWarningScope {
+                    ConfigWarningScope(const std::string& f) { outputConfigWarningFile = f; }
+                    ~ConfigWarningScope() { outputConfigWarningFile.clear(); }
+                } warningScope(cfgFile);
                 LogInfo(VB_CHANNELOUT, "Loading output plugin: type=%s, libname=%s\n", type.c_str(), ("fpp-co-" + libnamePfx + type).c_str());
                 FPPPlugins::ChannelOutputPlugin* p = dynamic_cast<FPPPlugins::ChannelOutputPlugin*>(PluginManager::INSTANCE.findPlugin(libnamePfx + type, "fpp-co-" + libnamePfx + type));
                 if (p) {
@@ -489,10 +510,6 @@ static bool ReloadChannelOutputsForFile(const std::string& cfgFile) {
                 }
                 if (channelOutput->output) {
                     LogInfo(VB_CHANNELOUT, "Calling Init() on %s output\n", type.c_str());
-                    struct ConfigWarningScope {
-                        ConfigWarningScope(const std::string& f) { outputConfigWarningFile = f; }
-                        ~ConfigWarningScope() { outputConfigWarningFile.clear(); }
-                    } warningScope(cfgFile);
                     bool initOK = channelOutput->output->Init(outputs[c]);
                     if (initOK) {
                         // Every output reads (PrepData) or sends from exactly the
@@ -501,21 +518,25 @@ static bool ReloadChannelOutputsForFile(const std::string& cfgFile) {
                         // drops an out-of-bounds range from the read set, but the
                         // output itself would still walk off the end of the
                         // buffer every frame, so it must not be started at all.
+                        bool bad = false;
                         int badMin = 0;
                         int badMax = -1;
-                        channelOutput->output->GetRequiredChannelRanges([&badMin, &badMax](int m1, int m2) {
-                            // Only a non-empty range past the end: an inverted
-                            // one is how an output with nothing to send reports.
-                            if (badMax < 0 && m2 >= m1 && m2 >= (int)FPPD_MAX_CHANNELS) {
+                        channelOutput->output->GetRequiredChannelRanges([&bad, &badMin, &badMax](int m1, int m2) {
+                            // Only a non-empty range outside the buffer: an
+                            // inverted one is how an output with nothing to
+                            // send reports.  Before channel 1 is as bad as past
+                            // the end: an output reads channelData[m1] either way.
+                            if (!bad && m2 >= m1 && (m1 < 0 || m2 >= (int)FPPD_MAX_CHANNELS)) {
+                                bad = true;
                                 badMin = m1;
                                 badMax = m2;
                             }
                         });
-                        if (badMax >= 0) {
+                        if (bad) {
                             std::string warning = "Output type " + type + " needs channels " +
                                                   std::to_string(badMin + 1) + "-" + std::to_string(badMax + 1) +
-                                                  ", beyond the " + std::to_string(FPPD_MAX_CHANNELS) +
-                                                  " channel limit. Output disabled.";
+                                                  ", outside 1-" + std::to_string(FPPD_MAX_CHANNELS) +
+                                                  ". Output disabled.";
                             WarningHolder::AddWarning(26, warning);
                             LogErr(VB_CHANNELOUT, "%s\n", warning.c_str());
                             outputLoadWarnings[cfgFile].insert(warning);
@@ -672,9 +693,10 @@ void OverlayOutputTestData(std::set<std::string> types, unsigned char* channelDa
         }
     }
 }
-// see the note on HasUniverseOutputs() for why this walk stays unlocked
+// see the note on HasUniverseOutputs() for the lock this walk takes
 std::set<std::string> GetOutputTypes() {
     std::set<std::string> ret;
+    std::shared_lock<std::shared_mutex> l(outputListFreeLock);
     for (auto inst = channelOutputs.load(); inst != nullptr; inst = inst->next) {
         auto output = inst->output;
         if (output && output->SupportsTesting()) {

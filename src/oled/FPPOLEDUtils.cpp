@@ -69,6 +69,8 @@ void FPPOLEDUtils::cleanup() {
     actions.clear();
 }
 
+std::atomic<int> FPPOLEDUtils::exitSignal{ 0 };
+
 static const std::string EMPTY_STRING = "";
 
 // gpio.json "rising"/"falling" entries were a single command object in FPP 9
@@ -524,7 +526,7 @@ void FPPOLEDUtils::run() {
     long long lastUpdateTime = 0;
     long long ntime = MonotonicMicros();
     long long lastActionTime = MonotonicMicros();
-    while (true) {
+    while (exitSignal.load() == 0) {
         bool forcedOff = currentStatus->forceOff;
         if (OLEDPage::IsForcedOff() && !forcedOff) {
             // turning back on
@@ -578,7 +580,16 @@ void FPPOLEDUtils::run() {
             }
 
             if (actionCount) {
-                poll(&fdset[0], actionCount, needsPolling ? 100 : 5000);
+                // Wake no later than the next 1s page iteration.  The status
+                // page counts iterations as seconds ("FPP Booting..." becomes
+                // "No Network" after 60), so a longer idle wait slows all of
+                // its timing down by the same factor.
+                int timeout = needsPolling ? 100 : 1000;
+                long long untilUpdate = (lastUpdateTime + 1000000 - MonotonicMicros()) / 1000 + 1;
+                if (untilUpdate < timeout) {
+                    timeout = untilUpdate < 1 ? 1 : (int)untilUpdate;
+                }
+                poll(&fdset[0], actionCount, timeout);
             } else {
                 usleep(100000);
             }

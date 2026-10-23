@@ -36,6 +36,7 @@
 #include "settings.h"
 
 #include "overlays/wled/wled.h"   // AudioFrame, fetchAudioSamples, computeAudioFrame
+#include "SysSocket.h"
 
 WLEDAudioSync WLEDAudioSync::INSTANCE;
 
@@ -213,7 +214,7 @@ void WLEDAudioSync::StopAllThreads() {
 }
 
 bool WLEDAudioSync::OpenSendSocket() {
-    m_sendSocket = ::socket(AF_INET, SOCK_DGRAM, 0);
+    m_sendSocket = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (m_sendSocket < 0) return false;
 
     // Enable broadcast (allows 255.255.255.255 / x.x.x.255 destinations).
@@ -229,7 +230,7 @@ bool WLEDAudioSync::OpenSendSocket() {
 }
 
 bool WLEDAudioSync::OpenReceiveSocket() {
-    m_recvSocket = ::socket(AF_INET, SOCK_DGRAM, 0);
+    m_recvSocket = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (m_recvSocket < 0) return false;
 
     int yes = 1;
@@ -341,13 +342,15 @@ void WLEDAudioSync::SendLoop() {
 
 void WLEDAudioSync::ReceiveLoop() {
     AudioSyncPacketV2 pkt;
+    uint8_t buf[sizeof(AudioSyncPacketV2) + 1]; // one spare byte: a longer datagram reads 45 and is dropped
+
     sockaddr_in from{};
     socklen_t fromLen = sizeof(from);
     bool firstPacketLogged = false;
 
     while (m_running) {
         fromLen = sizeof(from);
-        ssize_t n = ::recvfrom(m_recvSocket, &pkt, sizeof(pkt), 0,
+        ssize_t n = ::recvfrom(m_recvSocket, buf, sizeof(buf), 0,
                                reinterpret_cast<sockaddr*>(&from), &fromLen);
         if (n <= 0) {
             // Socket closed by Cleanup(), or transient error — bail
@@ -366,6 +369,7 @@ void WLEDAudioSync::ReceiveLoop() {
         // very old WLED firmware; we accept the V2 form only since that's
         // what every current WLED build emits.
         if (n != sizeof(AudioSyncPacketV2)) continue;
+        std::memcpy(&pkt, buf, sizeof(pkt));
         if (std::memcmp(pkt.header, WLED_HEADER_V2, 5) != 0) continue;
 
         // The floats come from anyone on the LAN and go straight into the

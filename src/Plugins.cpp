@@ -22,11 +22,13 @@
 #include <dirent.h>
 #include <dlfcn.h>
 #include <errno.h>
+#include <algorithm>
 #include <chrono>
 #include <thread>
 #include <list>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -61,6 +63,58 @@ PluginManager PluginManager::INSTANCE;
 // still inside that plugin's code and it is safe to destroy. File-static rather
 // than a member so PluginManager's layout is unchanged for plugins.
 static std::mutex channelDataPluginsLock;
+
+// mPlaylistPlugins is walked from whichever thread made the playlist or media
+// transition - the main loop, an HTTP or MQTT thread, a scheduler command -
+// while a runtime load or unload edits it on the main loop and an unload then
+// deletes the plugin. A walk copies the list under this lock, then, just
+// before each call, checks under it again that the plugin is still listed and
+// counts it as in flight for that one call; finishUnload() waits for a
+// plugin's count to drain before deleting it. Checking per call matters: an
+// unload that lands mid-walk must keep the plugins later in the copy from
+// being entered after their shutdown(), and must wait only on a call that is
+// really running, not on a slow callback into some other plugin. Nothing is
+// held across the calls themselves: script plugins block in waitpid() for
+// seconds, and a callback can start another transition, which walks the list
+// again on the same thread. File-static, like channelDataPluginsLock, so
+// PluginManager's layout is unchanged for plugins.
+static std::mutex playlistPluginsLock;
+static std::condition_variable playlistPluginCallDone;
+static std::map<FPPPlugins::Plugin*, int> playlistPluginCallsInFlight;
+
+template<class F>
+static void ForEachPlaylistPlugin(const std::vector<FPPPlugins::PlaylistEventPlugin*>& plugins, F&& f) {
+    std::vector<FPPPlugins::PlaylistEventPlugin*> snapshot;
+    {
+        std::lock_guard<std::mutex> lock(playlistPluginsLock);
+        snapshot = plugins;
+    }
+    for (auto a : snapshot) {
+        FPPPlugins::Plugin* key = nullptr;
+        {
+            std::lock_guard<std::mutex> lock(playlistPluginsLock);
+            if (std::find(plugins.begin(), plugins.end(), a) == plugins.end()) {
+                continue; // unloaded since the copy was taken, maybe freed
+            }
+            // Only now: the cast reads the object, which is live only while
+            // it is still listed.
+            key = dynamic_cast<FPPPlugins::Plugin*>(a);
+            playlistPluginCallsInFlight[key]++;
+        }
+        struct Done {
+            FPPPlugins::Plugin* key;
+            ~Done() {
+                std::lock_guard<std::mutex> lock(playlistPluginsLock);
+                auto it = playlistPluginCallsInFlight.find(key);
+                if (it != playlistPluginCallsInFlight.end() && --it->second <= 0) {
+                    playlistPluginCallsInFlight.erase(it);
+                    playlistPluginCallDone.notify_all();
+                }
+            }
+        } done{ key };
+        f(a);
+    }
+}
 
 namespace FPPPlugins
 {
@@ -283,6 +337,22 @@ public:
     }
 
     virtual std::unique_ptr<Result> run(const std::vector<std::string>& args) override {
+        // Everything the child needs is built before the fork: fppd is
+        // threaded, and a child that allocates or logs can block forever on a
+        // lock another thread held at the fork (see PlaylistCallback::run()).
+        std::string eventScript = directory + "/" + script;
+        std::string mediaDir = "MEDIADIR=" + getFPPMediaDir();
+        std::string fppDir = "FPPDIR=" + getFPPDDir();
+        std::string pluginDir = "SCRIPTDIR=" + directory;
+        std::vector<const char*> envs = { mediaDir.c_str(), fppDir.c_str(), pluginDir.c_str(), nullptr };
+        std::vector<const char*> sargs;
+        sargs.push_back(eventScript.c_str());
+        for (auto& a : args) {
+            sargs.push_back(a.c_str());
+        }
+        sargs.push_back(nullptr);
+        LogDebug(VB_PLUGIN, "Calling %s for command: %s\n", script.c_str(), name.c_str());
+
         int pid = fork();
         if (pid == -1) {
             // Usually out of memory.  This runs on whatever thread ran the
@@ -291,41 +361,11 @@ public:
             return std::make_unique<Command::ErrorResult>(name + " failed: could not start the script");
         }
         if (pid == 0) {
-            LogDebug(VB_PLUGIN, "Child process, calling %s for command: %s\n", script.c_str(), name.c_str());
-
-            std::string eventScript = directory + "/" + script;
-
-            std::vector<const char*> sargs;
-            std::vector<const char*> envs;
-
-            char mediaDir[1024];
-            char fppDir[1024];
-            char pluginDir[1024];
-            snprintf(mediaDir, sizeof(mediaDir), "MEDIADIR=%s", getFPPMediaDir().c_str());
-            snprintf(fppDir, sizeof(fppDir), "FPPDIR=%s", getFPPDDir().c_str());
-            snprintf(pluginDir, sizeof(pluginDir), "SCRIPTDIR=%s", directory.c_str());
-            envs.push_back(mediaDir);
-            envs.push_back(fppDir);
-            envs.push_back(pluginDir);
-            envs.push_back(nullptr);
-
-            sargs.push_back(eventScript.c_str());
-            for (auto& a : args) {
-                sargs.push_back(a.c_str());
-            }
-            sargs.push_back(nullptr);
-
             execve(eventScript.c_str(), (char* const*)&sargs[0], (char* const*)&envs[0]);
-
-            LogErr(VB_PLUGIN, "We failed to exec our command callback:  %s\n", FPPstrerror(errno));
-            for (auto a : sargs) {
-                LogErr(VB_PLUGIN, "  %s\n", a);
-            }
             _exit(EXIT_FAILURE);
-        } else {
-            LogExcess(VB_PLUGIN, "Command parent process, resuming work.\n");
-            waitpid(pid, nullptr, 0);
         }
+        LogExcess(VB_PLUGIN, "Command parent process, resuming work.\n");
+        waitpid(pid, nullptr, 0);
         return std::make_unique<Command::Result>(name + " complete");
     }
 
@@ -490,16 +530,44 @@ void PluginManager::Cleanup() {
         mPendingUnloads.pop_back();
         finishUnload(p);
     }
+    // A playlist or media callback can still be inside a plugin on another
+    // thread: the MQTT thread handling a playlist command, or a command thread.
+    // Nothing waited for those, so the deletes below could free a plugin (a
+    // script plugin blocks in waitpid() for as long as its script runs) while
+    // it was still running.  Detach them all, as an unload does, and wait for
+    // the calls in flight -- briefly: shutdown has a budget.  A plugin still
+    // busy past that is left alive, and so is every plugin library, since its
+    // code may still be running: each path from here ends in exec or _exit.
+    std::set<FPPPlugins::Plugin*> busy;
+    {
+        std::unique_lock<std::mutex> lock(playlistPluginsLock);
+        mPlaylistPlugins.clear();
+        if (!playlistPluginCallDone.wait_for(lock, std::chrono::seconds(2), []() {
+                return playlistPluginCallsInFlight.empty();
+            })) {
+            for (auto& [plugin, n] : playlistPluginCallsInFlight) {
+                busy.insert(plugin);
+            }
+        }
+    }
+    for (auto* a : busy) {
+        LogWarn(VB_PLUGIN, "Plugin %s is still in a playlist callback at shutdown; leaving it\n",
+                a->getName().c_str());
+    }
     // Inbound HTTP is disarmed above and the routes have drained, so no request
     // is inside plugin code. Now let each plugin stop its own activity - threads,
     // timers, connections - while it is still a whole object. Destructors are too
     // late for that: a thread calling in during destruction reads a plugin that
     // is half gone.
     for (auto& a : mPlugins) {
-        a->shutdown();
+        if (!busy.count(a)) {
+            a->shutdown();
+        }
     }
     while (!mPlugins.empty()) {
-        delete mPlugins.back();
+        if (!busy.count(mPlugins.back())) {
+            delete mPlugins.back();
+        }
         mPlugins.pop_back();
     }
     mPluginDirNames.clear();
@@ -509,8 +577,10 @@ void PluginManager::Cleanup() {
     // destructor dispatch doesn't hit unmapped memory. The call is idempotent
     // (guarded by an atomic flag), so the subsequent call in main() is a no-op.
     CommandManager::INSTANCE.Cleanup();
-    for (auto& a : mShlibHandles) {
-        dlclose(a);
+    if (busy.empty()) {
+        for (auto& a : mShlibHandles) {
+            dlclose(a);
+        }
     }
     mShlibHandles.clear();
 }
@@ -882,6 +952,7 @@ void PluginManager::addPlugin(FPPPlugins::Plugin* p) {
 
     FPPPlugin::PlaylistEventPlugin* pep = dynamic_cast<FPPPlugin::PlaylistEventPlugin*>(p);
     if (pep) {
+        std::lock_guard<std::mutex> lock(playlistPluginsLock);
         mPlaylistPlugins.push_back(pep);
     }
     FPPPlugin::ChannelOutputPlugin* coep = dynamic_cast<FPPPlugin::ChannelOutputPlugin*>(p);
@@ -898,10 +969,13 @@ void PluginManager::addPlugin(FPPPlugins::Plugin* p) {
         mAPIProviderPlugins.push_back(app);
     }
 }
+template<class P, class F>
+static void CallIntoPlugin(P* p, const char* what, F&& f);
+
 void PluginManager::mediaCallback(const Json::Value& playlist, const MediaDetails& mediaDetails) {
-    for (auto a : mPlaylistPlugins) {
-        a->mediaCallback(playlist, mediaDetails);
-    }
+    ForEachPlaylistPlugin(mPlaylistPlugins, [&](FPPPlugins::PlaylistEventPlugin* a) {
+        CallIntoPlugin(a, "mediaCallback", [&]() { a->mediaCallback(playlist, mediaDetails); });
+    });
 }
 void PluginManager::registerApis() {
     for (auto a : mAPIProviderPlugins) {
@@ -1027,7 +1101,10 @@ void PluginManager::detachPlugin(FPPPlugins::Plugin* plugin) {
             }
         }
     };
-    drop(mPlaylistPlugins);
+    {
+        std::lock_guard<std::mutex> lock(playlistPluginsLock);
+        drop(mPlaylistPlugins);
+    }
     drop(mChannelOutputPlugins);
     {
         std::lock_guard<std::mutex> lock(channelDataPluginsLock);
@@ -1148,8 +1225,15 @@ bool PluginManager::unloadPlugin(const std::string& name, std::string& error) {
             if (it == current.end() || it->second != c.second) {
                 continue;
             }
-            CommandManager::INSTANCE.removeCommand(c.first); // unregisters only
-            delete c.second;
+            if (dynamic_cast<ScriptCommand*>(c.second)) {
+                // FPP's own class, so it may outlive this call: a script can
+                // run for any length of time, and its run must finish on a
+                // live object.
+                CommandManager::INSTANCE.retireCommand(c.second);
+            } else {
+                CommandManager::INSTANCE.removeCommand(c.first); // unregisters only
+                delete c.second;
+            }
             leftBehind.push_back(c.first);
         }
         // Say so rather than quietly covering for it: a C++ plugin reaching this
@@ -1264,6 +1348,16 @@ void PluginManager::pollPendingUnload(const std::string& name) {
 void PluginManager::finishUnload(PendingUnload& p) {
     // Drop the predicate before the library goes: it is the plugin's code too.
     p.ready = nullptr;
+    // Detached already, but a playlist or media callback that took its copy of
+    // the list before then may still be inside the plugin on another thread.
+    {
+        std::unique_lock<std::mutex> lock(playlistPluginsLock);
+        if (!playlistPluginCallDone.wait_for(lock, std::chrono::seconds(30), [&p]() {
+                return playlistPluginCallsInFlight.find(p.plugin) == playlistPluginCallsInFlight.end();
+            })) {
+            LogWarn(VB_PLUGIN, "Plugin %s still had a playlist callback running after 30 s; deleting it anyway\n", p.name.c_str());
+        }
+    }
     mPluginDirNames.erase(p.plugin); // so the map never holds a freed pointer
     delete p.plugin;                 // the plugin's own full teardown
     if (p.unmap && p.handle) {
@@ -1304,18 +1398,70 @@ void PluginManager::multiSyncData(const std::string& pn, uint8_t* data, int len)
     }
 }
 void PluginManager::playlistCallback(const Json::Value& playlist, const std::string& action, const std::string& section, int item) {
-    for (auto a : mPlaylistPlugins) {
+    ForEachPlaylistPlugin(mPlaylistPlugins, [&](FPPPlugins::PlaylistEventPlugin* a) {
         CallIntoPlugin(a, "playlistCallback", [&]() { a->playlistCallback(playlist, action, section, item); });
-    }
+    });
 }
 void PluginManager::playlistInserted(const std::string& playlist, const int position, int endPosition, bool immediate) {
-    for (auto a : mPlaylistPlugins) {
+    ForEachPlaylistPlugin(mPlaylistPlugins, [&](FPPPlugins::PlaylistEventPlugin* a) {
         CallIntoPlugin(a, "playlistInserted", [&]() { a->playlistInserted(playlist, position, endPosition, immediate); });
-    }
+    });
 }
 
 // blocking
 void MediaCallback::run(const Json::Value& playlist, const MediaDetails& mediaDetails) {
+    // Built before the fork, and the child only execs: see PlaylistCallback::run().
+    std::string eventScript = FPP_DIR + "/scripts/eventScript";
+    Json::Value root;
+
+    root["type"] = playlist["currentEntry"]["type"];
+
+    root["Sequence"] = playlist["currentEntry"]["type"].asString() == "both" ? playlist["currentEntry"]["sequence"]["sequenceName"].asString().c_str() : "";
+    root["Media"] = playlist["currentEntry"]["type"].asString() == "both"
+                        ? playlist["currentEntry"]["media"]["mediaFilename"].asString().c_str()
+                        : playlist["currentEntry"]["mediaFilename"].asString().c_str();
+    if (!mediaDetails.title.empty()) {
+        root["title"] = mediaDetails.title;
+    }
+    if (!mediaDetails.artist.empty()) {
+        root["artist"] = mediaDetails.artist;
+    }
+    if (!mediaDetails.album.empty()) {
+        root["album"] = mediaDetails.album;
+    }
+    if (mediaDetails.year) {
+        root["year"] = std::to_string(mediaDetails.year);
+    }
+    if (!mediaDetails.comment.empty()) {
+        root["comment"] = mediaDetails.comment;
+    }
+    if (mediaDetails.track) {
+        root["track"] = std::to_string(mediaDetails.track);
+    }
+    if (!mediaDetails.genre.empty()) {
+        root["genre"] = mediaDetails.genre;
+    }
+    if (mediaDetails.length) {
+        root["length"] = std::to_string(mediaDetails.length);
+    }
+    if (mediaDetails.seconds) {
+        root["seconds"] = std::to_string(mediaDetails.seconds);
+    }
+    if (mediaDetails.minutes) {
+        root["minutes"] = std::to_string(mediaDetails.minutes);
+    }
+    if (mediaDetails.bitrate) {
+        root["bitrate"] = std::to_string(mediaDetails.bitrate);
+    }
+    if (mediaDetails.sampleRate) {
+        root["sampleRate"] = std::to_string(mediaDetails.sampleRate);
+    }
+    if (mediaDetails.channels) {
+        root["channels"] = std::to_string(mediaDetails.channels);
+    }
+
+    std::string pluginData = SaveJsonToString(root);
+    LogDebug(VB_PLUGIN, "Media plugin data: %s\n", pluginData.c_str());
     int pid;
 
     if ((pid = fork()) == -1) {
@@ -1326,70 +1472,29 @@ void MediaCallback::run(const Json::Value& playlist, const MediaDetails& mediaDe
     }
 
     if (pid == 0) {
-        LogDebug(VB_PLUGIN, "Child process, calling %s callback for media : %s\n", mName.c_str(), mFilename.c_str());
-
-        std::string eventScript = FPP_DIR + "/scripts/eventScript";
-        Json::Value root;
-
-        root["type"] = playlist["currentEntry"]["type"];
-
-        root["Sequence"] = playlist["currentEntry"]["type"].asString() == "both" ? playlist["currentEntry"]["sequence"]["sequenceName"].asString().c_str() : "";
-        root["Media"] = playlist["currentEntry"]["type"].asString() == "both"
-                            ? playlist["currentEntry"]["media"]["mediaFilename"].asString().c_str()
-                            : playlist["currentEntry"]["mediaFilename"].asString().c_str();
-        if (!mediaDetails.title.empty()) {
-            root["title"] = mediaDetails.title;
-        }
-        if (!mediaDetails.artist.empty()) {
-            root["artist"] = mediaDetails.artist;
-        }
-        if (!mediaDetails.album.empty()) {
-            root["album"] = mediaDetails.album;
-        }
-        if (mediaDetails.year) {
-            root["year"] = std::to_string(mediaDetails.year);
-        }
-        if (!mediaDetails.comment.empty()) {
-            root["comment"] = mediaDetails.comment;
-        }
-        if (mediaDetails.track) {
-            root["track"] = std::to_string(mediaDetails.track);
-        }
-        if (!mediaDetails.genre.empty()) {
-            root["genre"] = mediaDetails.genre;
-        }
-        if (mediaDetails.length) {
-            root["length"] = std::to_string(mediaDetails.length);
-        }
-        if (mediaDetails.seconds) {
-            root["seconds"] = std::to_string(mediaDetails.seconds);
-        }
-        if (mediaDetails.minutes) {
-            root["minutes"] = std::to_string(mediaDetails.minutes);
-        }
-        if (mediaDetails.bitrate) {
-            root["bitrate"] = std::to_string(mediaDetails.bitrate);
-        }
-        if (mediaDetails.sampleRate) {
-            root["sampleRate"] = std::to_string(mediaDetails.sampleRate);
-        }
-        if (mediaDetails.channels) {
-            root["channels"] = std::to_string(mediaDetails.channels);
-        }
-
-        std::string pluginData = SaveJsonToString(root);
-        LogDebug(VB_PLUGIN, "Media plugin data: %s\n", pluginData.c_str());
         execl(eventScript.c_str(), "eventScript", mFilename.c_str(), "--type", "media", "--data", pluginData.c_str(), NULL);
-
-        LogErr(VB_PLUGIN, "We failed to exec our media callback!\n");
         _exit(EXIT_FAILURE);
-    } else {
-        LogExcess(VB_PLUGIN, "Media parent process, resuming work.\n");
-        waitpid(pid, NULL, 0);
     }
+    LogExcess(VB_PLUGIN, "Media parent process, resuming work.\n");
+    waitpid(pid, NULL, 0);
 }
 
 void PlaylistCallback::run(const Json::Value& playlist, const std::string& action, const std::string& section, int idx) {
+    // Everything the child needs is built here, before the fork, and the
+    // child only execs.  fppd is threaded and these run on any thread (an
+    // MQTT stop runs them on mosquitto's): a child that allocated or logged
+    // could block forever on a lock another thread held at the moment of the
+    // fork -- the logger's, an allocator's -- and this thread then waited for
+    // it in waitpid() for good, the main loop with it.
+    std::string eventScript = FPP_DIR + "/scripts/eventScript";
+    Json::Value root = playlist;
+    root["Action"] = action;
+    root["Section"] = section;
+    root["Item"] = idx;
+    std::string pluginData = SaveJsonToString(root);
+    LogDebug(VB_PLUGIN, "Calling %s callback for playlist: %s\n", mName.c_str(), mFilename.c_str());
+    LogDebug(VB_PLUGIN, "Playlist plugin data: %s\n", pluginData.c_str());
+
     int pid;
     if ((pid = fork()) == -1) {
         LogErr(VB_PLUGIN, "Failed to fork for %s's playlist callback: %s\n", mName.c_str(), FPPstrerror(errno));
@@ -1397,28 +1502,16 @@ void PlaylistCallback::run(const Json::Value& playlist, const std::string& actio
     }
 
     if (pid == 0) {
-        LogDebug(VB_PLUGIN, "Child process, calling %s callback for media : %s\n", mName.c_str(), mFilename.c_str());
-
-        std::string eventScript = FPP_DIR + "/scripts/eventScript";
-        Json::Value root;
-
-        root = playlist;
-        root["Action"] = action;
-        root["Section"] = section;
-        root["Item"] = idx;
-
-        std::string pluginData = SaveJsonToString(root);
-        LogDebug(VB_PLUGIN, "Playlist plugin data: %s\n", pluginData.c_str());
         execl(eventScript.c_str(), "eventScript", mFilename.c_str(), "--type", "playlist", "--data", pluginData.c_str(), NULL);
-
-        LogErr(VB_PLUGIN, "We failed to exec our playlist callback!\n");
         _exit(EXIT_FAILURE);
-    } else {
-        LogExcess(VB_PLUGIN, "Playlist parent process, resuming work.\n");
-        waitpid(pid, NULL, 0);
     }
+    LogExcess(VB_PLUGIN, "Playlist parent process, resuming work.\n");
+    waitpid(pid, NULL, 0);
 }
 void LifecycleCallback::run(const std::string& lifecycle) {
+    // Built before the fork, and the child only execs: see PlaylistCallback::run().
+    std::string eventScript = FPP_DIR + "/scripts/eventScript";
+    LogDebug(VB_PLUGIN, "Calling %s callback for lifecycle %s: %s\n", mName.c_str(), lifecycle.c_str(), mFilename.c_str());
     int pid;
     if ((pid = fork()) == -1) {
         LogErr(VB_PLUGIN, "Failed to fork for %s's %s callback\n", mName.c_str(), lifecycle.c_str());
@@ -1426,13 +1519,7 @@ void LifecycleCallback::run(const std::string& lifecycle) {
     }
 
     if (pid == 0) {
-        LogDebug(VB_PLUGIN, "Child process, calling %s callback for lifecycle : %s\n", mName.c_str(), mFilename.c_str());
-
-        std::string eventScript = FPP_DIR + "/scripts/eventScript";
-        LogDebug(VB_PLUGIN, "Lifecycle plugin data: %s\n", lifecycle.c_str());
         execl(eventScript.c_str(), "eventScript", mFilename.c_str(), "--type", "lifecycle", lifecycle.c_str(), NULL);
-
-        LogErr(VB_PLUGIN, "We failed to exec our lifecycle callback!\n");
         _exit(EXIT_FAILURE);
     } else {
         LogExcess(VB_PLUGIN, "Lifecycle parent process, resuming work.\n");

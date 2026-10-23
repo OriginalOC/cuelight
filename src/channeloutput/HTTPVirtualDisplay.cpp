@@ -14,7 +14,6 @@
 
 #include "fpp-json.h"
 
-#include "Warnings.h" // WarningHolder -- needed directly for NOPCH builds
 
 #include <netinet/in.h>
 #include <poll.h>
@@ -30,8 +29,11 @@
 #include "../common.h"
 
 #include "HTTPVirtualDisplay.h"
+#include "ChannelOutputSetup.h"
 
 #include "Plugin.h"
+#include "../SysSocket.h"
+
 class HTTPVirtualDisplayPlugin : public FPPPlugins::Plugin, public FPPPlugins::ChannelOutputPlugin {
 public:
     HTTPVirtualDisplayPlugin() :
@@ -62,6 +64,7 @@ HTTPVirtualDisplayOutput::HTTPVirtualDisplayOutput(unsigned int startChannel,
     m_socket(-1),
     m_running(true),
     m_connListChanged(true),
+    m_resetCache(false),
     m_connThread(nullptr),
     m_selectThread(nullptr) {
     LogDebug(VB_CHANNELOUT, "HTTPVirtualDisplayOutput::HTTPVirtualDisplayOutput(%u, %u)\n",
@@ -146,7 +149,7 @@ int HTTPVirtualDisplayOutput::Init(Json::Value config) {
 
     if (!InitializePixelMap()) {
         LogErr(VB_CHANNELOUT, "Error, unable to initialize pixel map\n");
-        WarningHolder::AddWarning(37, "Virtual Display preview: could not initialize pixel map");
+        AddOutputConfigWarning(37, "Virtual Display preview: could not initialize pixel map");
         return 0;
     }
 
@@ -158,7 +161,7 @@ int HTTPVirtualDisplayOutput::Init(Json::Value config) {
         virtualDisplayBufferBytes(m_width, m_height, m_bytesPerPixel) == 0) {
         LogErr(VB_CHANNELOUT, "Error, virtual display has no usable buffer (%dx%d)\n",
                m_width, m_height);
-        WarningHolder::AddWarning(37, "Virtual Display preview: could not initialize pixel map");
+        AddOutputConfigWarning(37, "Virtual Display preview: could not initialize pixel map");
         return 0;
     }
 
@@ -174,10 +177,10 @@ int HTTPVirtualDisplayOutput::Init(Json::Value config) {
     // is reachable on both IPv4 and IPv6 clients without needing two
     // listeners. Apache's mod_proxy talks to us on localhost; both
     // 127.0.0.1 and ::1 land here.
-    m_socket = socket(AF_INET6, SOCK_STREAM, 0);
+    m_socket = OpenSocket(AF_INET6, SOCK_STREAM, 0);
     if (m_socket < 0) {
         LogErr(VB_CHANNELOUT, "Could not create socket: %s\n", FPPstrerror(errno));
-        WarningHolder::AddWarning(37, "Virtual Display preview: could not create socket");
+        AddOutputConfigWarning(37, "Virtual Display preview: could not create socket");
         return 0;
     }
 
@@ -203,14 +206,14 @@ int HTTPVirtualDisplayOutput::Init(Json::Value config) {
     int rc = bind(m_socket, (struct sockaddr*)&addr, sizeof(addr));
     if (rc < 0) {
         LogErr(VB_CHANNELOUT, "Could not bind socket: %s\n", FPPstrerror(errno));
-        WarningHolder::AddWarning(37, "Virtual Display preview: could not bind to its port (already in use?)");
+        AddOutputConfigWarning(37, "Virtual Display preview: could not bind to its port (already in use?)");
         return 0;
     }
 
     rc = listen(m_socket, 5);
     if (rc < 0) {
         LogErr(VB_CHANNELOUT, "Could not listen on socket: %s\n", FPPstrerror(errno));
-        WarningHolder::AddWarning(37, "Virtual Display preview: could not listen on its socket");
+        AddOutputConfigWarning(37, "Virtual Display preview: could not listen on its socket");
         return 0;
     }
 
@@ -236,7 +239,7 @@ void HTTPVirtualDisplayOutput::ConnectionThread(void) {
     int client;
 
     while (m_running) {
-        client = accept(m_socket, NULL, NULL);
+        client = AcceptSocket(m_socket, NULL, NULL);
 
         if (client >= 0) {
             // Enable TCP keepalive to detect dead connections
@@ -275,10 +278,11 @@ void HTTPVirtualDisplayOutput::ConnectionThread(void) {
                        "Access-Control-Allow-Credentials: true\r\n"
                        "\r\n";
 
-            // Reset our display cache so we draw everything needed
-            bzero(m_virtualDisplay, m_screenSize);
-
+            // Have the output thread reset its display cache so the next frame
+            // draws everything; set before the client is listed, so a frame that
+            // sees the client also sees the reset.
             std::unique_lock<std::mutex> lock(m_connListLock);
+            m_resetCache = true;
             m_connList.push_back(client);
 
             write(client, sseResp.c_str(), sseResp.length());
@@ -489,6 +493,11 @@ void HTTPVirtualDisplayOutput::PrepData(unsigned char* channelData) {
 
     // Start a fresh rollback record for this frame's cache writes
     m_cacheRollback.clear();
+
+    // A client joined: it has nothing yet, so diff this frame against black.
+    if (m_resetCache.exchange(false)) {
+        bzero(m_virtualDisplay, m_screenSize);
+    }
 
     // Fast black detection - check if all channel data is zero (sequence ended/stopped)
     // Only do this check occasionally to reduce CPU overhead

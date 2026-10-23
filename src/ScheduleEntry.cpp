@@ -346,7 +346,7 @@ void ScheduleEntry::CalculateHinduDiwali(int year, int& month, int& day) {
     int diwaliDates[][3] = {
         {2024, 11, 1}, {2025, 10, 21}, {2026, 11, 9}, {2027, 10, 29},
         {2028, 10, 17}, {2029, 11, 5}, {2030, 10, 26}, {2031, 11, 14},
-        {2032, 11, 2}, {2033, 10, 23}, {2034, 11, 12}, {2035, 11, 1}
+        {2032, 11, 2}, {2033, 10, 23}, {2034, 11, 10}, {2035, 10, 30}
     };
     
     for (int i = 0; i < 12; i++) {
@@ -482,6 +482,8 @@ std::string ScheduleEntry::DateFromLocaleHoliday(Json::Value& holiday, int refYe
             if (rollForward &&
                 ((month < (now.tm_mon + 1)) ||
                  (month == (now.tm_mon + 1) && day < now.tm_mday))) {
+                int thisMonth = month;
+                int thisDay = day;
                 year++;
                 // Recalculate for next year
                 if (calendar == "chinese") {
@@ -496,6 +498,13 @@ std::string ScheduleEntry::DateFromLocaleHoliday(Json::Value& holiday, int refYe
                     CalculateIslamicDate(year, islamicMonth, islamicDay, month, day);
                 } else if (calendar == "hindu") {
                     CalculateHinduDiwali(year, month, day);
+                }
+                // Yearless, next year's date matches this year too if it is
+                // still to come: keep this year's, which has passed. The daily
+                // reload picks up next year's.
+                if ((month > (now.tm_mon + 1)) || (month == (now.tm_mon + 1) && day >= now.tm_mday)) {
+                    month = thisMonth;
+                    day = thisDay;
                 }
             }
         } else {
@@ -927,10 +936,11 @@ void ScheduleEntry::GetTimeFromSun(time_t& when, const std::string info,
 
         LogErr(VB_SCHEDULE, "Error, Latitude/Longitude not usable ('%s', '%s'), using Falcon, Colorado coordinates!\n",
                latStr.c_str(), lonStr.c_str());
-        WarningHolder::AddWarning(48, LATLON_WARNING);
-    } else {
-        // Coordinates are usable - clear the warning if it was previously raised.
-        WarningHolder::RemoveWarning(48, LATLON_WARNING);
+        // A load warning, so the next load retracts it: removing it only here,
+        // when sun times are next computed with good coordinates, left it up
+        // for good once the last sun-relative entry was deleted instead.  A
+        // Latitude/Longitude change reloads the schedule (see Scheduler()).
+        ScheduleLoadWarning(48, LATLON_WARNING);
     }
     time_t currTime = when;
     struct tm local;

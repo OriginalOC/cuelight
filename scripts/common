@@ -374,6 +374,22 @@ logStage() {
     echo "===== $1 ====="
 }
 
+# Built binaries start with an ELF/Mach-O header; a power loss after a build can
+# leave them zero-filled (#3120). Mirrors fppdBinaryValid() in www/common.php.
+fppdBinaryValid() {
+    local f magic
+    [ -x "${FPPBINDIR}/fppd" ] || return 1
+    for f in "${FPPBINDIR}/fppd" "${FPPBINDIR}/fppinit" "${FPPBINDIR}/libfpp.so" "${FPPBINDIR}/libfpp.dylib"; do
+        [ -e "$f" ] || continue
+        magic=$(head -c 4 "$f" 2>/dev/null | od -An -tx1 | tr -d ' \n')
+        case "$magic" in
+            7f454c46|cffaedfe|cefaedfe|cafebabe) ;;
+            *) return 1 ;;
+        esac
+    done
+    return 0
+}
+
 getSetting() {
     SETTING=$1
     if [ -f "${CFGFILE}" ]; then
@@ -433,6 +449,9 @@ setSetting() {
     fi
 }
 
+# Apache that is not running (a container, an image build) is not a failure:
+# it reads the new config when it starts. Config upgrades end with this call,
+# and a non-zero status there stops upgrade_config and every later migration.
 gracefullyReloadApacheConf() {
     if [[ "$OSTYPE" == "darwin"* ]]; then
         # macOS
@@ -449,8 +468,7 @@ gracefullyReloadApacheConf() {
             sudo systemctl reload apache2
             echo "Apache configuration reloaded successfully."
         else
-            echo "Apache is not running."
-            return 1
+            echo "Apache is not running - nothing to reload."
         fi
     elif [[ -f /etc/redhat-release ]]; then
         # RHEL/CentOS/Fedora
@@ -458,8 +476,7 @@ gracefullyReloadApacheConf() {
             sudo systemctl reload httpd
             echo "Apache configuration reloaded successfully."
         else
-            echo "Apache is not running."
-            return 1
+            echo "Apache is not running - nothing to reload."
         fi
     else
         echo "Unsupported OS"

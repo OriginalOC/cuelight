@@ -295,10 +295,15 @@ public:
     }
 };
 } // namespace
+// The atomic members replaced plain ones in place; a plugin's inline getter
+// built against the old header must still find the same bytes.
+static_assert(sizeof(std::atomic<int>) == sizeof(int) && alignof(std::atomic<int>) == alignof(int));
+static_assert(sizeof(std::atomic<time_t>) == sizeof(time_t) && alignof(std::atomic<time_t>) == alignof(time_t));
+
 /*
  *
  */
-Playlist::Playlist(Playlist* parent) :
+Playlist::Playlist(std::shared_ptr<Playlist> parent) :
     m_parent(parent),
     m_repeat(0),
     m_loop(0),
@@ -307,6 +312,7 @@ Playlist::Playlist(Playlist* parent) :
     m_blankAtEnd(1),
     m_startTime(0),
     m_subPlaylistDepth(0),
+    m_scheduleEntry(-1),
     m_forceStop(0),
     m_stopAtPos(-1),
     m_loadStartPos(-1),
@@ -1180,7 +1186,7 @@ int Playlist::StopNowImpl(int forceStop) {
     StreamSlotManager::Instance().StopBackgroundSlots();
 
     std::map<std::string, std::string> keywords;
-    keywords["PLAYLIST_NAME"] = m_name;
+    keywords["PLAYLIST_NAME"] = GetPlaylistName();
     if (CommandManager::INSTANCE.HasPreset("PLAYLIST_STOPPING_NOW")) {
         // Deferred — preset commands run inline and can re-enter the
         // playlist; fired after this stop completes (PlaylistTransitionGuard).
@@ -1252,7 +1258,7 @@ int Playlist::StopGracefullyImpl(int forceStop, int afterCurrentLoop) {
         m_status = FPP_STATUS_STOPPING_GRACEFULLY;
     }
     m_forceStop = forceStop;
-    if (Playlist* par = m_parent.load()) {
+    if (std::shared_ptr<Playlist> par = m_parent.load()) {
         par->StopGracefullyImpl(forceStop, afterCurrentLoop);
     }
 
@@ -1260,7 +1266,7 @@ int Playlist::StopGracefullyImpl(int forceStop, int afterCurrentLoop) {
 }
 
 void Playlist::Pause() {
-    LogDebug(VB_PLAYLIST, "Playlist::Pause called on %s\n", m_filename.c_str());
+    LogDebug(VB_PLAYLIST, "Playlist::Pause called on %s\n", GetPlaylistName().c_str());
     PlaylistTransitionGuard guard;
     std::unique_lock<std::recursive_mutex> lck(m_playlistMutex);
     if (std::shared_ptr<Playlist> cur = CurrentIfNotThis()) {
@@ -1279,7 +1285,7 @@ void Playlist::Pause() {
     }
 }
 void Playlist::Resume() {
-    LogDebug(VB_PLAYLIST, "Playlist::Resume called on %s\n", m_filename.c_str());
+    LogDebug(VB_PLAYLIST, "Playlist::Resume called on %s\n", GetPlaylistName().c_str());
     PlaylistTransitionGuard guard;
     std::unique_lock<std::recursive_mutex> lck(m_playlistMutex);
     if (std::shared_ptr<Playlist> cur = CurrentIfNotThis()) {
@@ -1449,9 +1455,14 @@ int Playlist::Process(void) {
     // streams (a second language on another audio output, a second display)
     // stay locked to the show rather than free-running.  Hooked here rather
     // than in ProcessMedia(), which the main loop only calls in REMOTE_MODE.
-    if (mediaOutputStatus.status == MEDIAOUTPUTSTATUS_PLAYING &&
-        mediaOutputStatus.mediaSeconds > 0.0f) {
-        StreamSlotManager::Instance().SyncSlotsToMaster(mediaOutputStatus.mediaSeconds);
+    float mediaSecs;
+    {
+        // A resume on a command thread rewrites these (PlaylistEntryMedia).
+        std::lock_guard<std::mutex> fieldsLock(MediaOutputStatus::FieldsLock());
+        mediaSecs = mediaOutputStatus.mediaSeconds;
+    }
+    if (mediaOutputStatus.status == MEDIAOUTPUTSTATUS_PLAYING && mediaSecs > 0.0f) {
+        StreamSlotManager::Instance().SyncSlotsToMaster(mediaSecs);
     }
 
     // LogExcess(VB_PLAYLIST, "Playlist::Process: %s, section %s, position: %d\n", m_name.c_str(), m_currentSectionStr.c_str(), m_sectionPosition);
@@ -1657,7 +1668,7 @@ int Playlist::Process(void) {
                 }
             } else if (m_currentSectionStr == "MainPlaylist") {
                 m_loop++;
-                LogDebug(VB_PLAYLIST, "mainPlaylist loop now: %d\n", m_loop);
+                LogDebug(VB_PLAYLIST, "mainPlaylist loop now: %d\n", m_loop.load());
                 if ((m_repeat) && (!m_loopCount || (m_loop < m_loopCount))) {
                     ReloadIfNeeded();
 
@@ -1676,7 +1687,7 @@ int Playlist::Process(void) {
                     if (!m_loopCount)
                         LogDebug(VB_PLAYLIST, "mainPlaylist repeating for another loop, loopCount == 0\n");
                     else
-                        LogDebug(VB_PLAYLIST, "mainPlaylist repeating for another loop, %d <= %d\n", m_loop, m_loopCount);
+                        LogDebug(VB_PLAYLIST, "mainPlaylist repeating for another loop, %d <= %d\n", m_loop.load(), m_loopCount);
 
                     // A pass this short has nothing in it that takes time;
                     // repeated as-is it would spin the main loop. Hold the next
@@ -1792,6 +1803,16 @@ Playlist* Playlist::SwitchToInsertedPlaylist(bool isStopping) {
         // of playlists: the new playlist takes our place by inheriting our
         // parent, and we clean ourselves up once it is known to be running.
         bool replaceSelf = isStopping && (m_parent.load() != nullptr);
+        // The new playlist's parent: ours if it replaces us, else us.
+        std::shared_ptr<Playlist> newParent = replaceSelf ? m_parent.load() : weak_from_this().lock();
+        if (!newParent) {
+            // Only an instance the player owns is processed, so this can't
+            // happen; without an owning reference to link to, don't insert.
+            LogErr(VB_PLAYLIST, "Not inserting playlist '%s': the playlist it interrupts is not owned by the player\n",
+                   m_insertedPlaylist.c_str());
+            m_insertedPlaylist = "";
+            return nullptr;
+        }
 
         // Bound the stack of inserted playlists.  Inline sub-playlists stop at
         // 5 levels in LoadJSONIntoPlaylist, but inserts (Insert Playlist
@@ -1799,7 +1820,7 @@ Playlist* Playlist::SwitchToInsertedPlaylist(bool isStopping) {
         // to itself, or A -> B -> A, nested one level per pass until memory or
         // the stack ran out.
         int depth = 1;
-        for (Playlist* p = replaceSelf ? m_parent.load() : this; p; p = p->m_parent.load()) {
+        for (std::shared_ptr<Playlist> p = newParent; p; p = p->m_parent.load()) {
             depth++;
         }
         if (depth > MAX_INSERTED_PLAYLIST_DEPTH) {
@@ -1812,7 +1833,7 @@ Playlist* Playlist::SwitchToInsertedPlaylist(bool isStopping) {
 
         // The player owns the new instance from birth; plRef only keeps it
         // alive across the start attempt below, before it is published.
-        std::shared_ptr<Playlist> plRef = Player::INSTANCE.CreatePlaylist(replaceSelf ? m_parent.load() : this);
+        std::shared_ptr<Playlist> plRef = Player::INSTANCE.CreatePlaylist(newParent);
         Playlist* pl = plRef.get();
         std::string plname = m_insertedPlaylist;
         // PlayImpl, not Play: this runs inside the parent's transition
@@ -1872,6 +1893,9 @@ void Playlist::SetIdle(bool exit) {
         keywords["PLAYLIST_NAME"] = m_name;
     }
     Cleanup();
+    // An insert still waiting for the current item to end goes with the
+    // playlist it was for.  Not in Cleanup(), which a reload also runs.
+    m_insertedPlaylist = "";
 
     bool publishIdle = true;
     // Walk up past parents that are already condemned to PL_CLEANUPS — making
@@ -1879,10 +1903,14 @@ void Playlist::SetIdle(bool exit) {
     // releases (leaving the player pointing at a corpse), or double-play it.  A
     // parent can be condemned while we're exiting when a re-entrant stop tore
     // down an intermediate level of an inserted-playlist stack.
-    Playlist* par = m_parent.load();
+    // par is held, not borrowed: another thread can condemn it once the walk
+    // lets go of the lock (a second Start Playlist that already sees it as
+    // current), and the main loop then releases it while this hand-back is
+    // still resuming it and reading its status.
+    std::shared_ptr<Playlist> par = m_parent.load();
     {
         std::lock_guard<std::mutex> lk(PL_CLEANUPS_LOCK);
-        while (par && std::find(PL_CLEANUPS.begin(), PL_CLEANUPS.end(), par) != PL_CLEANUPS.end()) {
+        while (par && std::find(PL_CLEANUPS.begin(), PL_CLEANUPS.end(), par.get()) != PL_CLEANUPS.end()) {
             par = par->m_parent.load();
         }
     }
@@ -1915,7 +1943,7 @@ void Playlist::SetIdle(bool exit) {
     if (handingBack) {
         // par is still owned: it is on the parent chain and not condemned, so
         // the player has never released it.
-        Player::INSTANCE.SetCurrentPlaylist(par);
+        Player::INSTANCE.SetCurrentPlaylist(par.get());
         // Unconditional: Resume() is a no-op unless par is paused, and par
         // may be STOPPING_* over a paused entry (stopped while we played).
         par->Resume();
@@ -2129,7 +2157,15 @@ int Playlist::PlayImpl(const std::string& filename, const int position, const in
             m_sectionPosition = 0;
             // position is a row of the playlist file; the loaded copy counts
             // a sub-playlist row's entries separately.
-            SetPosition(FileRowToPosition(position));
+            int p = FileRowToPosition(position);
+            int mainPos = p - (int)m_leadIn.size();
+            if ((m_random > 0) && (mainPos >= 0) && (mainPos < (int)m_mainPlaylist.size())) {
+                // The row maps to where the entry was loaded, and the main
+                // playlist is shuffled by now: as when starting part-way in
+                // below, play that entry next and the rest in a fresh shuffle.
+                p = ShuffleMainPlaylistFrom(p);
+            }
+            SetPosition(p);
             // Deliberate here, unlike the call at the end of this function:
             // this branch is a jump inside a playlist that is already running
             // (possibly stopping gracefully), so normalising to PLAYING is what
@@ -2203,19 +2239,11 @@ int Playlist::PlayImpl(const std::string& filename, const int position, const in
     }
 
     if ((tmpStartPos == 0 || tmpStartPos == -1) && (m_random > 0)) {
-        // Starting part-way into a shuffled main playlist: play the requested
-        // entry first, then the rest in a fresh shuffle.  Its row says nothing
-        // about which of the others have played.
-        PlaylistEntryBase* first = nullptr;
         int mainPos = p - (int)m_leadIn.size();
         if ((startRow > 0) && (mainPos >= 0) && (mainPos < (int)m_mainPlaylist.size())) {
-            first = m_mainPlaylist[mainPos];
-        }
-        RandomizeMainPlaylist();
-        if (first) {
-            m_mainPlaylist.erase(std::find(m_mainPlaylist.begin(), m_mainPlaylist.end(), first));
-            m_mainPlaylist.insert(m_mainPlaylist.begin(), first);
-            p = m_leadIn.size();
+            p = ShuffleMainPlaylistFrom(p);
+        } else {
+            RandomizeMainPlaylist();
         }
     }
 
@@ -2267,6 +2295,9 @@ int Playlist::PlayImpl(const std::string& filename, const int position, const in
  *
  */
 void Playlist::SetPosition(int position) {
+    // The MQTT position topics call this from the MQTT thread, while the
+    // playlist thread reads m_startPosition in Start() under the lock.
+    std::unique_lock<std::recursive_mutex> lck(m_playlistMutex);
     m_startPosition = position;
 
     Events::Publish("playlist/position/status", position);
@@ -2313,6 +2344,29 @@ void Playlist::RandomizeMainPlaylist() {
     }
 }
 
+// Starting part-way into a shuffled main playlist: the entry loaded at
+// position (counted across the whole playlist, as loaded) plays first, then
+// the rest in a fresh shuffle -- its row says nothing about which of the
+// others have played.  The entry is found by its load position, not by
+// index, since the main playlist may already be shuffled.  Returns the
+// position it now starts at.
+int Playlist::ShuffleMainPlaylistFrom(int position) {
+    PlaylistEntryBase* first = nullptr;
+    for (auto* e : m_mainPlaylist) {
+        if (e->GetPositionInPlaylist() == position) {
+            first = e;
+            break;
+        }
+    }
+    RandomizeMainPlaylist();
+    if (!first) {
+        return position;
+    }
+    m_mainPlaylist.erase(std::find(m_mainPlaylist.begin(), m_mainPlaylist.end(), first));
+    m_mainPlaylist.insert(m_mainPlaylist.begin(), first);
+    return m_leadIn.size();
+}
+
 /*
  *
  */
@@ -2320,7 +2374,7 @@ void Playlist::Dump(void) {
     LogDebug(VB_PLAYLIST, "Playlist: %s\n", m_name.c_str());
 
     LogDebug(VB_PLAYLIST, "  Description      : %s\n", m_desc.c_str());
-    LogDebug(VB_PLAYLIST, "  Repeat           : %d\n", m_repeat);
+    LogDebug(VB_PLAYLIST, "  Repeat           : %d\n", m_repeat.load());
     LogDebug(VB_PLAYLIST, "  Loop Count       : %d\n", m_loopCount);
     LogDebug(VB_PLAYLIST, "  Current Section  : %s\n", m_currentSectionStr.c_str());
     LogDebug(VB_PLAYLIST, "  Section Position : %d\n", m_sectionPosition);
@@ -2436,7 +2490,7 @@ static bool DeferIfReentrant(const char* what, void (Playlist::*fn)(void)) {
 }
 
 void Playlist::RestartItem(void) {
-    LogDebug(VB_PLAYLIST, "RestartItem called for '%s'\n", m_name.c_str());
+    LogDebug(VB_PLAYLIST, "RestartItem called for '%s'\n", GetPlaylistName().c_str());
     PlaylistTransitionGuard guard;
     if (DeferIfReentrant("RestartItem", &Playlist::RestartItem)) {
         return;
@@ -2468,7 +2522,7 @@ void Playlist::RestartItem(void) {
     Start();
 }
 void Playlist::NextItem(void) {
-    LogDebug(VB_PLAYLIST, "NextItem called for '%s'\n", m_name.c_str());
+    LogDebug(VB_PLAYLIST, "NextItem called for '%s'\n", GetPlaylistName().c_str());
     PlaylistTransitionGuard guard;
     if (DeferIfReentrant("NextItem", &Playlist::NextItem)) {
         return;
@@ -2543,7 +2597,7 @@ void Playlist::NextItem(void) {
  *
  */
 void Playlist::PrevItem(void) {
-    LogDebug(VB_PLAYLIST, "PrevItem called for '%s'\n", m_name.c_str());
+    LogDebug(VB_PLAYLIST, "PrevItem called for '%s'\n", GetPlaylistName().c_str());
     PlaylistTransitionGuard guard;
     if (DeferIfReentrant("PrevItem", &Playlist::PrevItem)) {
         return;
@@ -2672,12 +2726,23 @@ int Playlist::GetResumePosition(void) {
     // entries.  Resuming inside a sub-playlist restarts that sub-playlist: a
     // row is as fine as a position in the file can be.
     int pos = m_sectionPosition + (done ? 1 : 0);
-    int row = (pos >= (int)m_currentSection->size()) ? (int)rows.size() : SectionPositionToRow(rows, pos);
     int base = 0;
+    int loadedBase = 0;
     if (m_currentSection == &m_mainPlaylist) {
         base = m_leadInRows.size();
+        loadedBase = m_leadIn.size();
     } else if (m_currentSection == &m_leadOut) {
         base = m_leadInRows.size() + m_mainRows.size();
+        loadedBase = m_leadIn.size() + m_mainPlaylist.size();
+    }
+    int row = (int)rows.size();
+    if (pos < (int)m_currentSection->size()) {
+        // The row table is in load order, and a random playlist's main
+        // section is shuffled: go by where the entry was loaded, not by its
+        // index, or the resume lands on whichever entry was loaded at that
+        // index -- one that may already have played.
+        int loadedPos = (*m_currentSection)[pos]->GetPositionInPlaylist() - loadedBase;
+        row = SectionPositionToRow(rows, loadedPos);
     }
     return base + row;
 }
@@ -2901,7 +2966,7 @@ Json::Value Playlist::GetMqttStatusJSON(void) {
         entryArray.append(playlistEntry);
 
         playlist["name"] = m_name;
-        playlist["repeat"] = m_repeat;
+        playlist["repeat"] = m_repeat.load();
         playlist["description"] = m_desc;
         playlist["currentItems"] = entryArray;
         playlistArray.append(playlist);
@@ -2938,7 +3003,7 @@ void Playlist::GetCurrentStatus(Json::Value& result) {
     }
 
     std::string plname = m_name;
-    result["repeat_mode"] = m_repeat;
+    result["repeat_mode"] = m_repeat.load();
     result["current_playlist"]["description"] = m_desc;
     result["current_playlist"]["count"] = std::to_string(GetSize());
     result["current_playlist"]["index"] = std::to_string(GetPosition());
@@ -3063,13 +3128,13 @@ void Playlist::GetCurrentStatus(Json::Value& result) {
 }
 int Playlist::GetLevelCount() {
     int levels = 1;
-    for (Playlist* par = m_parent.load(); par; par = par->m_parent.load()) {
+    for (std::shared_ptr<Playlist> par = m_parent.load(); par; par = par->m_parent.load()) {
         levels++;
     }
     return levels;
 }
 void Playlist::GetParentPlaylistNames(std::list<std::string>& names) {
-    if (Playlist* par = m_parent.load()) {
+    if (std::shared_ptr<Playlist> par = m_parent.load()) {
         par->GetParentPlaylistNames(names);
         names.push_back(par->GetPlaylistName());
     }
@@ -3099,8 +3164,8 @@ void Playlist::GetInfo(Json::Value& result) {
     } else {
         result["name"] = m_name;
         result["desc"] = m_desc;
-        result["repeat"] = m_repeat;
-        result["loop"] = m_loop;
+        result["repeat"] = m_repeat.load();
+        result["loop"] = m_loop.load();
         result["loopCount"] = m_loopCount;
         result["random"] = m_random;
         result["blankAtEnd"] = m_blankAtEnd;
@@ -3165,7 +3230,7 @@ Json::Value Playlist::GetConfig(void) {
  */
 int Playlist::MQTTHandler(std::string topic, std::string msg) {
     LogDebug(VB_PLAYLIST, "Playlist::MQTTHandler('%s', '%s') while playing '%s'\n",
-             topic.c_str(), msg.c_str(), m_name.c_str());
+             topic.c_str(), msg.c_str(), GetPlaylistName().c_str());
 
     // note the leading /set/playlist will be removed from topic by now
 
@@ -3222,7 +3287,14 @@ int Playlist::MQTTHandler(std::string topic, std::string msg) {
     } else if (topic == "name/set") {
         LogInfo(VB_CONTROL, "playlist/%s is deprecated and will be removed in a future release\n",
                 topic.c_str());
-        Play(msg, m_sectionPosition, m_repeat);
+        // On the MQTT thread: the playlist thread moves m_sectionPosition
+        // under the lock as it advances.
+        int position;
+        {
+            std::unique_lock<std::recursive_mutex> lck(m_playlistMutex);
+            position = m_sectionPosition;
+        }
+        Play(msg, position, m_repeat);
 
     } else if (topic == "repeat/set") {
         LogInfo(VB_PLAYLIST, "playlist/%s is deprecated and will be removed in a future release\n",

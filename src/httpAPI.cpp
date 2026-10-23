@@ -50,6 +50,7 @@ extern std::atomic_int runMainFPPDLoop;
 #include <list>
 #include <stdint.h>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "MultiSync.h"
@@ -61,7 +62,11 @@ extern std::atomic_int runMainFPPDLoop;
 #include "Timers.h"
 
 #include <chrono>
+#include <condition_variable>
 #include <future>
+#include <memory>
+#include <mutex>
+#include <trantor/net/EventLoop.h>
 #include "Scheduler.h"
 #include "Sequence.h"
 #include "Variables.h"
@@ -253,6 +258,7 @@ void GetCurrentFPPDStatus(Json::Value& result) {
             std::unique_lock<std::mutex> lock(mediaOutputLock);
             if (mediaOutput) {
                 mediaFilename = mediaOutput->m_mediaFilename;
+                std::lock_guard<std::mutex> fl(MediaOutputStatus::FieldsLock());
                 secsElapsed = mediaOutputStatus.secondsElapsed;
                 secsRemaining = mediaOutputStatus.secondsRemaining;
             }
@@ -390,6 +396,51 @@ APIServer::APIServer() {
 /*
  *
  */
+// Set once fppd is stopping: the sync advice registered in Init() then turns
+// every new request (and WebSocket upgrade) away before it reaches a router.
+static std::atomic<bool> s_httpQuiescing{ false };
+
+// drogon's quit() frees its routers on the main loop *before* it stops the IO
+// loops: an IO thread still routing a request (the UI's status poll, say)
+// then reads a freed router (TSan: StaticFileRouter::route() reading the
+// default handler of a router the main loop just deleted). So before quit(),
+// new requests are refused, and each IO loop is made to run a task: a loop
+// runs queued tasks only between requests, so once every loop has run one,
+// none is inside a router, and none will enter one again.
+static void QuiesceHttpServer() {
+    s_httpQuiescing = true;
+    if (!drogon::app().isRunning()) {
+        return;
+    }
+    struct Barrier {
+        std::mutex lock;
+        std::condition_variable done;
+        size_t left = 0;
+    };
+    // Shared with the tasks: one still queued when the wait gives up runs later.
+    auto barrier = std::make_shared<Barrier>();
+    size_t loops = drogon::app().getThreadNum();
+    for (size_t i = 0; i < loops; i++) {
+        trantor::EventLoop* loop = drogon::app().getIOLoop(i);
+        if (!loop) {
+            continue;
+        }
+        {
+            std::lock_guard<std::mutex> l(barrier->lock);
+            barrier->left++;
+        }
+        loop->queueInLoop([barrier]() {
+            std::lock_guard<std::mutex> l(barrier->lock);
+            barrier->left--;
+            barrier->done.notify_all();
+        });
+    }
+    std::unique_lock<std::mutex> l(barrier->lock);
+    if (!barrier->done.wait_for(l, std::chrono::seconds(2), [&barrier]() { return barrier->left == 0; })) {
+        LogWarn(VB_HTTP, "%d HTTP IO loops still busy at shutdown\n", (int)barrier->left);
+    }
+}
+
 APIServer::~APIServer() {
     // Before drogon stops: the status push registers a WarningHolder listener
     // and holds connection pointers, both of which outlive quit() (which only
@@ -397,6 +448,7 @@ APIServer::~APIServer() {
     // on from here, so it gets turned off from here too.
     StatusWebSocketShutdown();
 
+    QuiesceHttpServer();
     drogon::app().quit();
     // Join the server thread so Drogon is fully stopped before we return.
     // PluginManager::Cleanup() (called from main() after MainLoop() exits)
@@ -470,7 +522,11 @@ static bool drogonVersionMatches() {
 
 void APIServer::Init(void) {
     if (!drogonVersionMatches()) {
-        exit(EXIT_FAILURE);
+        // _exit(), not exit(): fppd is half started, and the static
+        // destructors exit() runs can block on, or free memory under, the
+        // threads already running (see ExitWithoutTeardown() in fppd.cpp).
+        fflush(nullptr);
+        _exit(EXIT_FAILURE);
     }
     m_pr = std::make_shared<PlayerResource>();
 
@@ -744,7 +800,9 @@ void APIServer::Init(void) {
         static std::atomic<uint64_t> seq{ 0 };
         std::string timerName = "PluginLifecycle-" + std::to_string(seq++);
 
-        auto result = std::make_shared<std::promise<std::pair<bool, std::string>>>();
+        // The result carries whether the plugin is loaded afterwards too: the
+        // plugin lists are the main loop's, so they are read there, not here.
+        auto result = std::make_shared<std::promise<std::tuple<bool, std::string, bool>>>();
         auto done = result->get_future();
         Timers::INSTANCE.addTimer(timerName, GetTimeMS(), [result, name, load]() {
             // This runs plugin code (constructor, registerApis, shutdown,
@@ -763,7 +821,7 @@ void APIServer::Init(void) {
                 LogErr(VB_PLUGIN, "%s plugin \"%s\" threw a non-standard exception\n", load ? "Loading" : "Unloading",
                        TruncateForLog(name).c_str());
             }
-            result->set_value({ ok, err });
+            result->set_value({ ok, err, PluginManager::INSTANCE.isPluginLoaded(name) });
         });
 
         if (done.wait_for(std::chrono::seconds(30)) != std::future_status::ready) {
@@ -773,7 +831,7 @@ void APIServer::Init(void) {
                                         503, "application/json"));
             return;
         }
-        auto [ok, err] = done.get();
+        auto [ok, err, loaded] = done.get();
         // err can carry dlerror() text, which is not length-bounded either.
         LogInfo(VB_PLUGIN, "API - %s plugin \"%s\" (from %s): %s%s%s\n",
                 load ? "Load" : "Unload", TruncateForLog(name).c_str(), clientIP.c_str(),
@@ -782,7 +840,7 @@ void APIServer::Init(void) {
         resp["Status"] = ok ? "OK" : "ERROR";
         resp["Message"] = err;
         resp["plugin"] = name;
-        resp["loaded"] = PluginManager::INSTANCE.isPluginLoaded(name);
+        resp["loaded"] = loaded;
         callback(makeStringResponse(SaveJsonToString(resp), ok ? 200 : 400, "application/json"));
     };
     app.registerHandler("/fppd/plugin/{1}/{2}", handlePluginLifecycle, {drogon::Post});
@@ -1016,6 +1074,18 @@ void APIServer::Init(void) {
     // still work, they just go through a temp file.
     app.setClientMaxBodySize(32 * 1024 * 1024);
     app.setClientMaxMemoryBodySize(4 * 1024 * 1024);
+
+    // A sync advice runs before any router, for plain requests and WebSocket
+    // upgrades alike; see QuiesceHttpServer().
+    app.registerSyncAdvice([](const drogon::HttpRequestPtr&) -> drogon::HttpResponsePtr {
+        if (!s_httpQuiescing) {
+            return nullptr;
+        }
+        auto resp = drogon::HttpResponse::newHttpResponse();
+        resp->setStatusCode(drogon::k503ServiceUnavailable);
+        resp->setCloseConnection(true);
+        return resp;
+    });
 
     // SIGINT and SIGTERM are FPP's, not drogon's. Drogon's handlers only stop
     // drogon's own threads, leaving the main loop spinning, and they log (so

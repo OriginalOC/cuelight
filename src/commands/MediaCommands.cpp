@@ -35,6 +35,7 @@
 #include "../mediaoutput/GStreamerOut.h"
 #include "../mediaoutput/mediaoutput.h" // ResolveVideoOutput()
 #include "../mediaoutput/StreamSlotManager.h"
+#include "../CurlSocket.h"
 
 IncreaseVolumeCommand::IncreaseVolumeCommand() :
     Command("Volume Increase", "Increases the volume by the given amount (0 - 100)") {
@@ -65,10 +66,19 @@ std::unique_ptr<Command::Result> DecreaseVolumeCommand::run(const std::vector<st
     return std::make_unique<Command::Result>("Volume Set");
 }
 
+// A URL command's response is kept whole for the caller, so it is capped:
+// unbounded, one URL at a large or endless body (file:///dev/zero, before
+// the protocols were limited below, or any HTTP server that streams) grew it
+// until fppd was OOM-killed.  Returning short aborts the transfer.
+static constexpr size_t URL_MAX_RESPONSE = 4 * 1024 * 1024;
 static size_t URL_write_data(void* buffer, size_t size, size_t nmemb, void* userp) {
     std::string* msg = (std::string*)userp;
-    msg->append(static_cast<const char*>(buffer), size * nmemb);
-    return size * nmemb;
+    size_t n = size * nmemb;
+    if (msg->size() + n > URL_MAX_RESPONSE) {
+        return 0;
+    }
+    msg->append(static_cast<const char*>(buffer), n);
+    return n;
 }
 
 // A URL command's transfer outlives its Result. Fire-and-forget callers
@@ -160,6 +170,7 @@ public:
             data = args[2];
         }
         m_curl = curl_easy_init();
+        SetCurlCloseOnExec(m_curl);
         curl_easy_setopt(m_curl, CURLOPT_NOSIGNAL, 1);
         // Without these, a plain-HTTP URL that 301/302s to HTTPS (extremely
         // common) captures the redirect response instead of the real page -
@@ -173,6 +184,17 @@ public:
         curl_easy_setopt(m_curl, CURLOPT_USERAGENT, userAgent.c_str());
         curl_easy_setopt(m_curl, CURLOPT_FOLLOWLOCATION, 1L);
         curl_easy_setopt(m_curl, CURLOPT_MAXREDIRS, 10L);
+        // HTTP(S) only, for the URL and every redirect.  libcurl speaks file://,
+        // gopher://, dict:// and more by default, and this command is reachable
+        // from the API and MultiSync: "file:///etc/shadow" read any file as
+        // root, and gopher:// could put arbitrary bytes on a local port.
+#if LIBCURL_VERSION_NUM >= 0x075500
+        curl_easy_setopt(m_curl, CURLOPT_PROTOCOLS_STR, "http,https");
+        curl_easy_setopt(m_curl, CURLOPT_REDIR_PROTOCOLS_STR, "http,https");
+#else
+        curl_easy_setopt(m_curl, CURLOPT_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+        curl_easy_setopt(m_curl, CURLOPT_REDIR_PROTOCOLS, (long)(CURLPROTO_HTTP | CURLPROTO_HTTPS));
+#endif
         // A transfer may now outlive its Result (see AdoptOrphanTransfer()),
         // so it needs its own end.
         curl_easy_setopt(m_curl, CURLOPT_CONNECTTIMEOUT_MS, URL_CONNECT_TIMEOUT_MS);
@@ -479,6 +501,12 @@ GStreamerPlayData::~GStreamerPlayData() {
     // that Close() the slot manager (under its lock, from an HTTP thread) and
     // a late bus message could still call them. Close() is idempotent, so the
     // base destructor's own call is then a no-op.
+    //
+    // Whoever is deleting this owns it, so the Stopped() that Close() can
+    // reach must not hand it to RemoveRunningMedia's deferred delete as well
+    // (a second free, and a MEDIA_STOPPED for media that may never have
+    // played): a failed Start() can leave a pipeline for Close() to stop.
+    m_stoppedOnce.store(true);
     Close();
 }
 
@@ -636,9 +664,10 @@ std::unique_ptr<Command::Result> PlayMediaCommand::run(const std::vector<std::st
         // watch/state-change thread is ever installed, so Stopped() (and
         // thus RemoveRunningMedia()) will never be called. Without this,
         // the object -- and its map entry -- leaks forever. Deregister
-        // directly and delete; it is safe to delete here since Start()
-        // failing this early guarantees m_pipeline is still null, so the
-        // destructor's teardown path is a no-op (no double-stop/hang risk).
+        // directly and delete. Start() can fail with a pipeline already
+        // built (gst_parse_launch() returns one alongside a recoverable
+        // error), which the destructor's Close() stops; the destructor
+        // keeps that stop from scheduling a deferred delete of its own.
         LogErr(VB_COMMAND, "Play Media: could not start media %s\n", args[0].c_str());
         WarningHolder::AddWarningTimeout(60, 30, "Could not start media " + args[0]);
         runningMediaLock.lock();
@@ -767,10 +796,15 @@ std::unique_ptr<Command::Result> SetSlotVolumeCommand::run(const std::vector<std
     if (volume < 0) volume = 0;
     if (volume > 100) volume = 100;
 
-    if (StreamSlotManager::Instance().SetSlotVolume(slot, volume)) {
+    bool deferred = false;
+    if (StreamSlotManager::Instance().SetSlotVolume(slot, volume, &deferred)) {
+        if (deferred) {
+            return std::make_unique<Command::Result>("Slot " + std::to_string(slot) +
+                                                     " is idle; the volume applies when it next plays");
+        }
         return std::make_unique<Command::Result>("Volume set on slot " + std::to_string(slot));
     }
-    return std::make_unique<Command::ErrorResult>("Slot " + std::to_string(slot) + " not active");
+    return std::make_unique<Command::ErrorResult>("Slot volume is not available");
 }
 
 MediaSlotStatusCommand::MediaSlotStatusCommand() :

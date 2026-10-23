@@ -235,11 +235,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
             showCompressed: '.fcCompressed',
             popupModalId: 'fileCopyPopup_Modal',
             popupCloseBtnId: 'fileCopyPopup_ModalCloseButton',
-            copyPopupBodyId: 'fileCopyPopup'
+            copyPopupBodyId: 'fileCopyPopup',
+            copyButton: '#fileCopyRestoreBtn'
         };
 
         // Store all pending setting changes
         var pendingSettings = {};
+
+        // All settings on this page, none of which is saved before Finish.  The
+        // controls' own onChange handlers (from PrintSetting) save at once, and
+        // $(document).ready replaces them with ones that only track the change --
+        // so until the page has loaded, a change still reaches SetSetting.  A
+        // Location lookup answered while the page was still arriving did exactly
+        // that, and saved the time zone, locale and position on the spot.
+        var settingsToOverride = [
+            'passwordEnable', 'password', 'passwordVerify',
+            'osPasswordEnable', 'osPassword', 'osPasswordVerify',
+            'fppMode', 'HostName', 'HostDescription', 'InstalledCape', 'uiLevel',
+            'Locale', 'TimeZone', 'Latitude', 'Longitude', 'WifiRegulatoryDomain', 'LegalJurisdiction'
+        ];
+        var setupSaveSetting = SetSetting;
+        SetSetting = function (key, value) {
+            if (settingsToOverride.indexOf(key) === -1) {
+                return setupSaveSetting.apply(this, arguments);
+            }
+            pendingSettings[key] = value;
+            settings[key] = value;
+            if (typeof window['Update' + key + 'Children'] === 'function') {
+                window['Update' + key + 'Children'](0);
+            }
+        };
 
         // Generic function to track setting changes without saving
         function trackSettingChange(settingName) {
@@ -420,7 +445,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
             }
 
             var storageLocation;
-            var url = 'copystorage.php?wrapped=1&direction=' + direction;
+            var url = 'copystorage.php?wrapped=1&feed=' + fppFileCopy.newFeedId() + '&direction=' + direction;
 
             if (direction == 'FROMUSB') {
                 storageLocation = $('#fcUSBDevice').val();
@@ -480,7 +505,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
 
             $('#fileCopyPopup_ModalCloseButton').prop('disabled', true).text('Please Wait');
             $('#fileCopyText').val('');
-            StreamURL(url, 'fileCopyText', 'FileCopyDone', 'FileCopyTimeoutError');
+            StreamURL(url, 'fileCopyText', 'FileCopyDone', 'FileCopyTimeoutError', 'POST');
         }
 
         function CloseFileCopyDialog() {
@@ -508,7 +533,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
         //
         // Nothing here persists anything.  The page already routes every
         // tracked control's onChange into pendingSettings instead of saving
-        // (see the settingsToOverride block below), so steps are pure
+        // (see settingsToOverride and the SetSetting hold above), so steps are pure
         // show/hide and Back costs nothing.  Only finishSetup() writes.
         // ---------------------------------------------------------------
         // Every setting this page puts in front of the user, from the same groups
@@ -780,6 +805,13 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
                 'passwordEnable', 'osPasswordEnable'),
             function ($k) { return ReadSettingFromFile($k) !== false; }))) ?>;
 
+        // The password choices as the settings file holds them now (false when
+        // never recorded), so Finish can tell turning a password off from
+        // recording that there never was one.
+        var recordedPasswordChoices = <?= json_encode(array(
+            'passwordEnable' => ReadSettingFromFile('passwordEnable'),
+            'osPasswordEnable' => ReadSettingFromFile('osPasswordEnable'))) ?>;
+
         // Same question for the jurisdiction, asked the same way and for the same
         // reason: PHP's $settings has defaults merged in, so isset() is useless.
         var jurisdictionAnswered = <?= json_encode(ReadSettingFromFile('LegalJurisdiction') !== false) ?>;
@@ -1015,14 +1047,28 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
             // If UI/OS password auth is disabled, ignore password field writes even if
             // browser autofill or prior UI events populated pendingSettings.
             var filteredSettings = {};
+            // A "no password" answer is saved on its own (saveNoPasswordChoicesThen):
+            // it must be recorded, or the next run of setup asks for it again, but
+            // it goes through none of the password ordering below.
+            var noPasswordChoices = {};
             $.each(pendingSettings, function (key, value) {
                 if (key !== 'passwordVerify' && key !== 'osPasswordVerify') {
                     // During initial setup, disabled password auth should not try to
-                    // persist password-related fields at all.
+                    // persist the password fields themselves.  A value typed (or
+                    // autofilled) before "No Password" was chosen is still pending,
+                    // and saving it would apply it: osPassword runs chpasswd.
+                    if (key === 'password' && passwordEnable !== '1') {
+                        return;
+                    }
+                    if (key === 'osPassword' && osPasswordEnable !== '1') {
+                        return;
+                    }
                     if (key === 'passwordEnable' && passwordEnable !== '1') {
+                        noPasswordChoices[key] = value;
                         return;
                     }
                     if (key === 'osPasswordEnable' && osPasswordEnable !== '1') {
+                        noPasswordChoices[key] = value;
                         return;
                     }
                     filteredSettings[key] = value;
@@ -1255,6 +1301,26 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
                 savePut('rebootFlag', '1', true, done);
             }
 
+            // Record a "no password" answer.  It is only applied when it turns off
+            // a password the settings file says is on: otherwise nothing changes,
+            // and applying it would only rewrite the Apache config, or reset the
+            // fpp account's password to the default with chpasswd (~3s), for a
+            // choice that was already in effect.
+            function saveNoPasswordChoicesThen(done) {
+                var keys = Object.keys(noPasswordChoices);
+                function step(i) {
+                    if (failedSettings.length > 0 || i >= keys.length) {
+                        done();
+                        return;
+                    }
+                    var key = keys[i];
+                    savePut(key, noPasswordChoices[key], true, function () {
+                        step(i + 1);
+                    }, recordedPasswordChoices[key] !== '1');
+                }
+                step(0);
+            }
+
             function saveHostNameThen(done) {
                 if (failedSettings.length > 0 || hostNameKeys.length === 0) {
                     done();
@@ -1301,10 +1367,12 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
             function startSaving() {
                 var afterOthers = function () {
                     saveOsPasswordThen(function () {
-                        saveHostNameThen(function () {
-                            saveSSHKeysThen(function () {
-                                saveRebootFlagThen(function () {
-                                    recordConsentThen(saveCompletionAndPasswords);
+                        saveNoPasswordChoicesThen(function () {
+                            saveHostNameThen(function () {
+                                saveSSHKeysThen(function () {
+                                    saveRebootFlagThen(function () {
+                                        recordConsentThen(saveCompletionAndPasswords);
+                                    });
                                 });
                             });
                         });
@@ -1392,13 +1460,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
             });
 
             // Override all auto-generated onChange handlers to track changes instead of saving immediately
-            // List of all settings on this page
-            var settingsToOverride = [
-                'passwordEnable', 'password', 'passwordVerify',
-                'osPasswordEnable', 'osPassword', 'osPasswordVerify',
-                'fppMode', 'HostName', 'HostDescription', 'InstalledCape', 'uiLevel',
-                'Locale', 'TimeZone', 'Latitude', 'Longitude', 'WifiRegulatoryDomain', 'LegalJurisdiction'
-            ];
+            // (settingsToOverride, above, lists the settings on this page)
 
             // Replace onChange handlers for each setting
             $.each(settingsToOverride, function (index, settingName) {
@@ -1698,7 +1760,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST' && isset($_FILES['restoreFile'])) {
                                 <tr class="fcHost" style="display: none;">
                                     <td class="pe-3 pb-2">Remote Host:</td>
                                     <td class="pb-2">
-                                        <select id="fcHost" class="form-select" onchange="GetRemoteHostUSBStorage(); GetBackupHostBackupDirs($('#fcRemoteStorage').val())">
+                                        <select id="fcHost" class="form-select" onchange="GetRemoteHostUSBStorage()">
                                             <option value="">-- Select Remote Host --</option>
                                             <?php echo $hostOptions; ?>
                                         </select>

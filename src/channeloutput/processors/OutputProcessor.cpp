@@ -40,10 +40,7 @@
 OutputProcessors::OutputProcessors() {
 }
 OutputProcessors::~OutputProcessors() {
-    for (OutputProcessor* a : processors) {
-        delete a;
-    }
-    processors.clear();
+    removeAll();
 }
 
 void OutputProcessors::ProcessData(unsigned char* channelData) const {
@@ -65,15 +62,17 @@ bool OutputProcessors::rangeIsValid(OutputProcessor* p) {
     // off/white sentinel channels just past the buffer, or faults on every
     // frame.  Refuse it rather than trust each processor to clamp.  An
     // inverted range is how a processor with nothing to do reports.
+    bool bad = false;
     int badMin = 0;
     int badMax = -1;
-    p->GetRequiredChannelRanges([&badMin, &badMax](int m1, int m2) {
-        if (badMax < 0 && m2 >= m1 && (m1 < 0 || m2 >= (int)FPPD_MAX_CHANNELS)) {
+    p->GetRequiredChannelRanges([&bad, &badMin, &badMax](int m1, int m2) {
+        if (!bad && m2 >= m1 && (m1 < 0 || m2 >= (int)FPPD_MAX_CHANNELS)) {
+            bad = true;
             badMin = m1;
             badMax = m2;
         }
     });
-    if (badMax < 0) {
+    if (!bad) {
         return true;
     }
     std::string warning = "Output processor needs channels " + std::to_string(badMin + 1) + "-" +
@@ -104,11 +103,23 @@ void OutputProcessors::removeProcessor(OutputProcessor* p) {
     auto it = std::find(processors.begin(), processors.end(), p);
     if (it != processors.end()) {
         processors.erase(it);
+        // One loaded from outputprocessors.json (a playlist Remap "remove"
+        // matches those too) is also on fromJsonProcessors, which the next
+        // loadFromJSON() frees: take it off, or that frees it a second time.
+        fromJsonProcessors.remove(p);
         delete p;
     }
 }
 void OutputProcessors::removeAll() {
     std::lock_guard<std::mutex> lock(processorsLock);
+    // Everything in the chain, and the JSON processors rangeIsValid() kept
+    // out of it, which are on fromJsonProcessors alone.
+    for (OutputProcessor* a : fromJsonProcessors) {
+        if (std::find(processors.begin(), processors.end(), a) == processors.end()) {
+            delete a;
+        }
+    }
+    fromJsonProcessors.clear();
     for (OutputProcessor* a : processors) {
         delete a;
     }
@@ -285,5 +296,19 @@ void ProcessModelConfig(const Json::Value& config, std::string& model, int& star
     } else {
         model = "";
         --start;
+    }
+    // Processors report start + count * (1, 3 or 4) in an int.  A start or a
+    // count in the billions overflowed it into the inverted range that means
+    // "nothing to do", rangeIsValid() let the processor through, and its
+    // ProcessData() then wrote count channels from start: at boot, from
+    // outputprocessors.json, so fppd crash looped.  Pin both just outside the
+    // buffer instead, where the range still fails the check, and can't overflow.
+    if (start < 0) {
+        start = -1;
+    } else if (start > (int)FPPD_MAX_CHANNELS) {
+        start = FPPD_MAX_CHANNELS;
+    }
+    if (count > (int)FPPD_MAX_CHANNELS + 1) {
+        count = FPPD_MAX_CHANNELS + 1;
     }
 }

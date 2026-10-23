@@ -105,15 +105,19 @@ function SetupHtaccess($enablePW)
 
     if (!file_exists($filename)) {
         // Use sudo to create the file and set ownership to fpp:fpp
-        system("sudo touch " . escapeshellarg($filename));
-        system("sudo chown fpp:fpp " . escapeshellarg($filename));
+        exec("sudo touch " . escapeshellarg($filename));
+        exec("sudo chown fpp:fpp " . escapeshellarg($filename));
     }
 
     $data = "";
 
     if ($enablePW) {
         $data .= "AuthUserFile " . $settings['mediaDirectory'] . "/config/.htpasswd\nAuthType Basic\nAuthName \"Falcon Player\"\n";
-        $data .= "<RequireAny>\n  <RequireAll>\n    Require local\n  </RequireAll>\n  <RequireAll>\n    Require valid-user\n  </RequireAll>\n</RequireAny>\n\n";
+        // "Require local" also matches a request whose client address is the
+        // server's own, which is what /proxy/<this player's IP>/ produces:
+        // without the X-FPP-Proxied test (the header /proxy adds), anyone on
+        // the LAN skipped the password that way.
+        $data .= "<RequireAny>\n  <RequireAll>\n    Require local\n    Require expr \"%{HTTP:X-FPP-Proxied} == ''\"\n  </RequireAll>\n  <RequireAll>\n    Require valid-user\n  </RequireAll>\n</RequireAny>\n\n";
     } else {
         $data .= "<RequireAny>\n  Require all granted\n</RequireAny>\n\n";
     }
@@ -128,8 +132,10 @@ function SetupHtaccess($enablePW)
 
     file_put_contents($filename, $data, LOCK_EX);
 
-    //reload apache config
-    system("sudo service apache2 reload", $output);
+    //reload apache config.  exec(), not system(): this runs inside API calls
+    //and backup restores, whose JSON reply the service's "Reloading ..." line
+    //was being written into.
+    exec("sudo service apache2 reload 2>&1", $output);
 }
 
 function EnableUIPassword($value)
@@ -393,7 +399,11 @@ function SetGPIOFanProperties()
         $pfx = "#";
     }
     $contents = file_get_contents($configFile);
-    if (strpos($contents, "dtoverlay=gpio-fan") === false) {
+    // Ours is a line-anchored "dtoverlay=gpio-fan", commented out or not: the
+    // only kind the sed rewrite below (and the removal above) can touch.  Any
+    // other mention -- an indented copy, a comment -- used to count too, and
+    // then no line was written at all.
+    if (!preg_match('/^#?dtoverlay=gpio-fan/m', $contents)) {
         $contents = $contents . "\n";
         exec("echo \"\" | sudo tee -a " . GetDirSetting('boot') . "/config.txt");
         exec("echo \"[all]\" | sudo tee -a " . GetDirSetting('boot') . "/config.txt");

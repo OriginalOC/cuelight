@@ -78,6 +78,9 @@ public:
 
     virtual void DumpConfig() = 0;
 
+    // min is the first channel, 0-based; max is one past the last (every
+    // protocol works it out as startChannel + count - 1 from the 1-based
+    // startChannel).  UDPOutput converts it for ChannelOutput's inclusive max.
     virtual void GetRequiredChannelRange(int& min, int& max) {
         min = startChannel - 1;
         max = startChannel + channelCount - 1;
@@ -184,8 +187,12 @@ private:
     // tags this output's CurlManager requests so the destructor can cancel them
     const std::string curlOwner = "UDPOutput-" + std::to_string((uintptr_t)this);
     bool interfaceUp;
+    // the "Invalid interface" banner InitNetwork() raised, while it is up;
+    // InitNetwork() takes it down when the address arrives, Close() otherwise
+    std::string interfaceWarning;
 
-    bool InitNetwork();
+    // rebuildSockets: the address changed; drop the sockets made on the old one
+    bool InitNetwork(bool rebuildSockets = false);
     std::shared_ptr<SendSocketInfo> findOrCreateSocket(unsigned int key, int sc = 1);
 
     // Reachability is a property of the controller, not of each universe sent
@@ -196,7 +203,6 @@ private:
     std::map<std::string, std::shared_ptr<PingHost>> pingHosts;
     void OnPingResult(const std::shared_ptr<PingHost>& host, int ms);
     void SetHostValid(PingHost& host, bool valid);
-    void CloseNetwork();
 
     std::mutex socketMutex;
     UDPOutputMessages messages;
@@ -208,10 +214,18 @@ private:
     static std::map<const void*, std::function<UDPOutputData*()>> externalFactories;
     std::map<const void*, UDPOutputData*> externalOutputs;
     void attachExternalOutput(const void* owner, UDPOutputData* d);
+    static UDPOutputData* createExternalOutput(const std::function<UDPOutputData*()>& create);
 
     int networkCallbackId;
 
     void PingControllers(bool failedOnly);
+    // Takes this output's periodic pings back out of the PingManager (their
+    // callbacks capture this) and its "unreachable" warnings down. Close()
+    // does it; the destructor does it for an output deleted without Close(),
+    // as the loader deletes one whose Init() failed. Once only: after
+    // Close(), a replacement output may hold pings for the same hosts.
+    void StopPinging();
+    bool pingsStopped = false;
     // controllers that have not answered yet; Init() waits on it
     std::atomic_int failedCount;
     std::string HexToIP(unsigned int hex);
@@ -221,7 +235,7 @@ private:
     // A WorkItem owns a copy of the mmsghdr list and a reference on the socket
     // info so a worker that outlives its frame (stuck send to a dead controller)
     // cannot hit freed memory when PrepData rebuilds the message vectors or
-    // CloseNetwork drops the sockets.  Note the copy is shallow: the iovecs
+    // an address change drops the sockets.  Note the copy is shallow: the iovecs
     // still point at per-output buffers, so a late send may transmit the
     // *current* frame's bytes - acceptable, and no worse than it ever was.
     // generation identifies which frame queued it.

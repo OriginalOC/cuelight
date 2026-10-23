@@ -49,6 +49,13 @@ public:
     /// Get the active output for a slot (nullptr if idle).
     GStreamerOutput* GetActiveOutput(int slot);
 
+    /// First thing an output's Start() does: from here on the slot's status
+    /// is the new output's, before it is registered (SetActiveOutput) at the
+    /// end of a Start() that can take seconds.  An older output's ClearSlot()
+    /// that lands in between leaves the slot alone instead of wiping what the
+    /// new one has already written.
+    void ClaimSlot(int slot, GStreamerOutput* output);
+
     /// Clear a slot when playback finishes.  If `owner` is non-null, the slot
     /// is only cleared when it is still registered to that instance -- a
     /// stream whose teardown was already superseded by a newer stream on the
@@ -80,8 +87,10 @@ public:
     /// Get the PipeWire video node description for a slot.
     static std::string GetVideoNodeDescription(int slot);
 
-    /// Set volume on a specific slot (0-100). Returns true on success.
-    bool SetSlotVolume(int slot, int volume);
+    /// Set volume on a specific slot (0-100). An idle slot keeps it for its
+    /// next start, and *deferred (if given) says so. Returns false only for an
+    /// invalid slot or a build without media playback.
+    bool SetSlotVolume(int slot, int volume, bool* deferred = nullptr);
 
     /// Seek a slot to an absolute position in seconds.  Returns false if the
     /// slot is idle or the seek failed.
@@ -122,11 +131,13 @@ private:
         MediaOutputStatus status = {};
         GStreamerOutput* activeOutput = nullptr;
         GStreamerOutput* closingOutput = nullptr;  // detached, Close() not finished
+        GStreamerOutput* claimedBy = nullptr;      // started on this slot (ClaimSlot)
         std::string mediaFilename;
         bool isBackground = false;  // background slots don't block playlist
         bool syncToMaster = false;  // follow the primary media's clock
         long long lastSyncMS = 0;   // last drift check (see SyncSlotsToMaster)
         long long syncSettleMS = 0; // no drift checks until this time
+        int pendingVolume = -1;     // set while idle, applied at the next start
     };
 
     /// How often a sync-enabled slot's position is checked against the primary.

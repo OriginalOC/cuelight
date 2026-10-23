@@ -8,7 +8,8 @@ require_once '../commandsocket.php';
  *
  * Reboots the operating system.
  *
- * @route GET /api/system/reboot
+ * @route POST /api/system/reboot
+ * @route GET /api/system/reboot deprecated
  * @response 200 Reboot initiated
  * ```json
  * {"status": "OK"}
@@ -35,7 +36,8 @@ function RebootDevice()
  *
  * Executes a clean shutdown of the operating system.
  *
- * @route GET /api/system/shutdown
+ * @route POST /api/system/shutdown
+ * @route GET /api/system/shutdown deprecated
  * @response 200 Shutdown initiated
  * ```json
  * {"status": "OK"}
@@ -61,7 +63,8 @@ function SystemShutdownOS()
  *
  * Starts the `fppd` process idempotently (if it isn't already running).
  *
- * @route GET /api/system/fppd/start
+ * @route POST /api/system/fppd/start
+ * @route GET /api/system/fppd/start deprecated
  * @response 200 fppd started
  * ```json
  * {"status": "OK"}
@@ -116,7 +119,8 @@ function StopFPPDNoStatus()
  *
  * Stops the `fppd` process if it is running.
  *
- * @route GET /api/system/fppd/stop
+ * @route POST /api/system/fppd/stop
+ * @route GET /api/system/fppd/stop deprecated
  * @response 200 fppd stopped
  * ```json
  * {"status": "OK"}
@@ -135,7 +139,8 @@ function StopFPPD()
  * Restarts the `fppd` process. Pass `?quick=1` to reload some configuration without
  * a full restart.
  *
- * @route GET /api/system/fppd/restart
+ * @route POST /api/system/fppd/restart
+ * @route GET /api/system/fppd/restart deprecated
  * @response 200 fppd restarted
  * ```json
  * {"status": "OK"}
@@ -798,12 +803,12 @@ function UpdateActivityWriteCache($size, $mtime, $activity)
  */
 function GetUpdateActivityInternal($withLogTail = false)
 {
-    // Whether the fppd binary exists right now. Same condition menu.inc's
-    // "FPPD not found. Rebuild required" banner renders from
-    // (__DIR__ . "/../src/fppd" there, i.e. parent-of-www/src/fppd), so the
-    // UI can retire that banner without a refresh once a rebuild recreates
-    // the binary — or (re)show it when the build failed. One stat call.
-    $fppdBinaryExists = @file_exists(__DIR__ . '/../../../src/fppd');
+    // Whether the built fppd is present and runnable (fppdBinaryValid(), #3120).
+    // Same condition menu.inc's "FPPD is missing or damaged. Rebuild required"
+    // banner renders from, so the UI can retire that banner without a refresh
+    // once a rebuild recreates the binary — or (re)show it when the build
+    // failed. A few stats and 4-byte reads.
+    $fppdBinaryExists = fppdBinaryValid();
 
     // Version vector for stale-echo ordering (see js/fpp-update.js): every
     // payload carries the log's mtime+size, and the client drops anything
@@ -813,6 +818,15 @@ function GetUpdateActivityInternal($withLogTail = false)
     $logStatSize = @filesize($logFileForStat);
     if ($logStatSize === false) {
         $logStatSize = 0;
+    }
+    // 0 for a missing log, so that state is cached like any other: a player
+    // never updated from the UI has no log at all, and every status poll
+    // forked ps for it.  Every update starter writes the log or takes the
+    // lock before anything else, so neither a new run nor markerless work
+    // is hidden behind a cached idle payload.
+    $logStatMtime = @filemtime($logFileForStat);
+    if ($logStatMtime === false) {
+        $logStatMtime = 0;
     }
 
     $empty = array(
@@ -835,14 +849,11 @@ function GetUpdateActivityInternal($withLogTail = false)
     // open+flock; a held lock bypasses the cache so a starting update (or
     // a markerless rebuild) is never served stale. Skipped for the modal's
     // logTail path, which needs a fresh tail.
-    if (!$withLogTail && $logStatSize > 0) {
-        $logStatMtime = @filemtime($logFileForStat);
-        if ($logStatMtime !== false && !UpdateActivityLockHeld()) {
-            $cached = UpdateActivityReadCache($logStatSize, $logStatMtime);
-            if ($cached !== null) {
-                $cached['fppdBinaryExists'] = $fppdBinaryExists;
-                return $cached;
-            }
+    if (!$withLogTail && !UpdateActivityLockHeld()) {
+        $cached = UpdateActivityReadCache($logStatSize, $logStatMtime);
+        if ($cached !== null) {
+            $cached['fppdBinaryExists'] = $fppdBinaryExists;
+            return $cached;
         }
     }
 
@@ -856,11 +867,8 @@ function GetUpdateActivityInternal($withLogTail = false)
         if ($holder !== false || UpdateActivityProcessAlive()) {
             return UpdateActivityWorkersActive($empty, $holder, $tail['mtime'], $logStatSize, $withLogTail);
         }
-        if (!$withLogTail && $logStatSize > 0) {
-            $logCacheMtime = @filemtime($logFileForStat);
-            if ($logCacheMtime !== false) {
-                UpdateActivityWriteCache($logStatSize, $logCacheMtime, $empty);
-            }
+        if (!$withLogTail) {
+            UpdateActivityWriteCache($logStatSize, $logStatMtime, $empty);
         }
         return $empty;
     }
@@ -918,6 +926,9 @@ function GetUpdateActivityInternal($withLogTail = false)
         if ($holder !== false || UpdateActivityProcessAlive()) {
             return UpdateActivityWorkersActive($empty, $holder, $tail['mtime'], $logStatSize, $withLogTail);
         }
+        if (!$withLogTail) {
+            UpdateActivityWriteCache($logStatSize, $logStatMtime, $empty);
+        }
         return $empty;
     }
 
@@ -945,7 +956,7 @@ function GetUpdateActivityInternal($withLogTail = false)
         if (preg_match('/=====\s*' . preg_quote($startOp, '/') . '\s+FINISH:/', $lines[$j])) {
             break;
         }
-        if (preg_match('/^.*?=====\s*(Upgrade Complete|Upgrade Failed|Rebooting|Upgrade complete[^=]*)\s*=====\s*$/i', $lines[$j])) {
+        if (preg_match('/^.*?=====\s*(Upgrade Complete|Upgrade Failed|Rebooting|Rebuild Complete|Upgrade complete[^=]*)\s*=====\s*$/i', $lines[$j])) {
             break;
         }
     }
@@ -961,10 +972,14 @@ function GetUpdateActivityInternal($withLogTail = false)
         // switches and version checkouts can fail with only this marker
         // (no "Upgrade Failed" stage), so a nonzero rc is a failure outcome.
         // No break: a later "Upgrade Failed" terminal still overrides an
-        // rc=0 FINISH (see above).
+        // rc=0 FINISH (see above).  git_pull's rc=4 is not a failure: the
+        // update source was unreachable but the missing fppd was rebuilt,
+        // which is what a Rebuild is for (manualUpdate.php logs "Rebuild
+        // Complete"); a failed build exits 3.
         if (preg_match('/=====\s*' . preg_quote($startOp, '/') . '\s+FINISH:/', $line)) {
             $finished = true;
-            if (preg_match('/\(rc=(\d+)\)/', $line, $rcm) && intval($rcm[1]) !== 0) {
+            if (preg_match('/\(rc=(\d+)\)/', $line, $rcm) && intval($rcm[1]) !== 0
+                && !($startOp === 'fpp-update' && intval($rcm[1]) === 4)) {
                 $finishFailed = true;
                 $finishRc = intval($rcm[1]);
             }
@@ -972,7 +987,7 @@ function GetUpdateActivityInternal($withLogTail = false)
         }
         // Terminal stage logged after the script's tee is gone (PHP side of
         // manualUpdate.php / upgradeOS.php / upgradefpp.php).
-        if (preg_match('/^.*?=====\s*(Upgrade Complete|Upgrade Failed|Rebooting|Upgrade complete[^=]*)\s*=====\s*$/i', $line, $tm)) {
+        if (preg_match('/^.*?=====\s*(Upgrade Complete|Upgrade Failed|Rebooting|Rebuild Complete|Upgrade complete[^=]*)\s*=====\s*$/i', $line, $tm)) {
             $finished = true;
             if (stripos($tm[1], 'fail') !== false) {
                 $finishFailed = true;
@@ -1075,11 +1090,8 @@ function GetUpdateActivityInternal($withLogTail = false)
             // the previous finished run.
             return UpdateActivityWorkersActive($empty, $holder, $tail['mtime'], $logStatSize, $withLogTail);
         }
-        if (!$withLogTail && $logStatSize > 0) {
-            $logCacheMtime = @filemtime($logFileForStat);
-            if ($logCacheMtime !== false) {
-                UpdateActivityWriteCache($logStatSize, $logCacheMtime, $base);
-            }
+        if (!$withLogTail) {
+            UpdateActivityWriteCache($logStatSize, $logStatMtime, $base);
         }
         return $base;
     }
@@ -1094,11 +1106,8 @@ function GetUpdateActivityInternal($withLogTail = false)
         return $base;
     }
     $base['stale'] = true;
-    if (!$withLogTail && $logStatSize > 0) {
-        $logCacheMtime = @filemtime($logFileForStat);
-        if ($logCacheMtime !== false) {
-            UpdateActivityWriteCache($logStatSize, $logCacheMtime, $base);
-        }
+    if (!$withLogTail) {
+        UpdateActivityWriteCache($logStatSize, $logStatMtime, $base);
     }
     return $base;
 }

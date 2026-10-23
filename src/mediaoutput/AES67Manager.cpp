@@ -66,7 +66,9 @@
 
 #include "common.h"
 #include "log.h"
+#include "mediaoutput.h"
 #include "settings.h"
+#include "../SysSocket.h"
 
 // ──────────────────────────────────────────────────────────────────────────────
 // AES67 namespace helpers
@@ -91,6 +93,15 @@ const char* GetSDPChannelNames(int channels) {
 // ──────────────────────────────────────────────────────────────────────────────
 static AES67Manager s_aes67Manager;
 AES67Manager& AES67Manager::INSTANCE = s_aes67Manager;
+
+// Set a send pipeline's master volume element (see SetMasterVolume()).
+static void SetPipelineMasterVolume(GstElement* pipeline, int volume) {
+    GstElement* vol = gst_bin_get_by_name(GST_BIN(pipeline), "mastervol");
+    if (vol) {
+        g_object_set(vol, "volume", masterVolumeGain(volume), nullptr);
+        gst_object_unref(vol);
+    }
+}
 
 AES67Manager::AES67Manager() {
     m_configPath = getFPPMediaDir("/config/pipewire-aes67-instances.json");
@@ -620,6 +631,7 @@ bool AES67Manager::ApplyConfigLocked() {
     bool anySAP = false;
     bool sendFailed = false;
     bool recvFailed = false;
+    int failedStarts = 0;
     // Senders held idle because nothing feeds them -- published to
     // m_deferredSenders below, once the whole pass has run.
     std::map<int, std::string> deferred;
@@ -647,6 +659,7 @@ bool AES67Manager::ApplyConfigLocked() {
                 anySend = true;
             } else {
                 sendFailed = true;
+                failedStarts++;
             }
         }
 
@@ -655,6 +668,7 @@ bool AES67Manager::ApplyConfigLocked() {
                 anyRecv = true;
             } else {
                 recvFailed = true;
+                failedStarts++;
             }
         }
 
@@ -666,6 +680,7 @@ bool AES67Manager::ApplyConfigLocked() {
     {
         std::lock_guard<std::mutex> lock(m_pipelineMutex);
         m_deferredSenders = std::move(deferred);
+        m_failedStarts = failedStarts;
     }
 
     // Every enabled pipeline of that kind started, so whatever raised the
@@ -1003,6 +1018,7 @@ static void SignalChild(pid_t pid, int pidfd, int sig, const char* name) {
 }
 
 void AES67Manager::ForgetPtp4l() {
+    std::lock_guard<std::mutex> lock(m_ptp4lProcMutex);
     if (m_ptp4lPidfd >= 0) {
         close(m_ptp4lPidfd);
         m_ptp4lPidfd = -1;
@@ -1031,9 +1047,14 @@ bool AES67Manager::StartPtp4l(bool hwTimestamping, bool includeDscp) {
         // If exec fails
         _exit(127);
     }
-    m_ptp4lPid = pid;
-    m_ptp4lPidfd = OpenPidfd(pid);
-    if (m_ptp4lPidfd < 0 && errno == ESRCH) {
+    int pidfd = OpenPidfd(pid);
+    bool gone = pidfd < 0 && errno == ESRCH;
+    {
+        std::lock_guard<std::mutex> lock(m_ptp4lProcMutex);
+        m_ptp4lPid = pid;
+        m_ptp4lPidfd = pidfd;
+    }
+    if (gone) {
         // Exited and was reaped before we could even look.
         ForgetPtp4l();
         return false;
@@ -1241,7 +1262,20 @@ void AES67Manager::ShutdownPTP() {
     }
 
     StopChildProcess(m_phc2sysPid, m_phc2sysPidfd, "phc2sys");
-    StopChildProcess(m_ptp4lPid, m_ptp4lPidfd, "ptp4l");
+    {
+        // out of the members first, so a reader never polls the pidfd as it
+        // is closed; the wait for the child is made without the lock
+        pid_t pid;
+        int pidfd;
+        {
+            std::lock_guard<std::mutex> lock(m_ptp4lProcMutex);
+            pid = m_ptp4lPid;
+            pidfd = m_ptp4lPidfd;
+            m_ptp4lPid = -1;
+            m_ptp4lPidfd = -1;
+        }
+        StopChildProcess(pid, pidfd, "ptp4l");
+    }
     m_ptpHwTimestamping.store(false);
 
     if (!m_ptpConfPath.empty()) {
@@ -1270,6 +1304,7 @@ void AES67Manager::ShutdownPTP() {
 bool AES67Manager::IsPtp4lRunning() const {
     // SA_NOCLDWAIT means a dead ptp4l leaves no zombie holding its slot, so
     // the PID can be recycled by an unrelated process; see ChildAlive().
+    std::lock_guard<std::mutex> lock(m_ptp4lProcMutex);
     return m_ptp4lPid > 0 && ChildAlive(m_ptp4lPid, m_ptp4lPidfd, "ptp4l");
 }
 
@@ -1753,7 +1788,7 @@ bool AES67Manager::GetGrandmasterAddress(const std::string& gmId, std::string& a
 void AES67Manager::PtpAnnounceListenLoop() {
     LogInfo(VB_MEDIAOUT, "AES67 PTP announce listener thread started\n");
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         LogWarn(VB_MEDIAOUT, "AES67 PTP announce: socket failed: %s\n", FPPstrerror(errno));
         return;
@@ -1899,7 +1934,7 @@ static int PhcIndexForInterface(const std::string& iface) {
     if (iface.empty()) {
         return -1;
     }
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         return -1;
     }
@@ -1983,6 +2018,12 @@ GstClock* AES67Manager::GetOrCreateMediaClock() {
     if (!clock) {
         return nullptr;
     }
+    // A GstClock is born floating, and m_ptpClock is our own reference,
+    // released in ReleaseMediaClock().  The pipelines it goes to only ref it
+    // (gst_object_replace), so the counts balance today, but anything that
+    // ref_sinks it would take our reference over and our unref would then
+    // free a clock still in use.  Sink it here, as its owner.
+    gst_object_ref_sink(clock);
 
     std::string iface = GetPtpInterface();
     // The PHC is the domain's time only while ptp4l disciplines it.  A NIC
@@ -2772,6 +2813,9 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
         << "! audioconvert "
         << "! audioresample "
         << "! audioconvert "
+        // The master volume (see SetMasterVolume()).  Passes buffers through
+        // untouched at 100%.
+        << "! volume name=mastervol volume=" << masterVolumeGain(getVolume()) << " "
         // Rate trim for the drift control loop.  Sits in the float domain
         // because that is all this element accepts, and ahead of the S24BE
         // conversion and the packet split so both still see a clean stream.
@@ -3047,6 +3091,18 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
     // and setting it from a probe on the first buffer was measured to do
     // nothing at all.
     //
+    // That makes it provisional.  It is taken when the pipeline is built, and
+    // the first audio reaches the sink whenever the graph first feeds this node
+    // -- 100 ms later on a Pi, a second or more when a group links it late.
+    // Every packet then carries an RTP time that much earlier than it should,
+    // and the servo below could only ever answer that by moving transmission
+    // earlier, past the point where the audio has arrived at all: from then on
+    // udpsink sent each buffer the moment it arrived, a quantum at a time, and
+    // the lead it measured (its own projection) still read +3 ms while the
+    // wire was tens of ms late.  So the servo's probe re-anchors the timeline
+    // on the first packet that actually reaches the sink, by shifting the RTP
+    // timestamp it carries -- and every one after it by the same amount.
+    //
     // On its own that anchor does not hold.  Every source discontinuity makes
     // the drift loop re-anchor its PTS timeline to absorb the gap ("-231 ms gap
     // absorbed"), while the RTP sample counter does not move with it, so the
@@ -3092,6 +3148,9 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
             int instanceId;
             bool logged;
             gint64 latency;   // sink render delay; -1 until queried
+            gint64 anchorNs;  // RTP time ahead of PTP at the first packet
+            bool anchored;    // rtpShift taken from the first packet
+            guint32 rtpShift; // added to every RTP timestamp from then on
         };
         GstElement* sinkEl = gst_bin_get_by_name(GST_BIN(pipeline), "usink");
         GstPad* sinkPad = sinkEl ? gst_element_get_static_pad(sinkEl, "sink") : nullptr;
@@ -3099,7 +3158,9 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
             auto* sv = new LeadServo{ GST_CLOCK(gst_object_ref(ptpClock)),
                                       gst_pipeline_get_pipeline_clock(GST_PIPELINE(pipeline)),
                                       (gint64)m_config.targetLeadMs * GST_MSECOND,
-                                      0, inst.id, false, -1 };
+                                      0, inst.id, false, -1,
+                                      (gint64)m_config.sinkPacingMs * GST_MSECOND,
+                                      false, 0 };
             gst_pad_add_probe(
                 sinkPad, GST_PAD_PROBE_TYPE_BUFFER,
                 [](GstPad* pad, GstPadProbeInfo* info, gpointer user) -> GstPadProbeReturn {
@@ -3110,9 +3171,46 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
                         return GST_PAD_PROBE_OK;
                     }
                     GstBuffer* b = GST_PAD_PROBE_INFO_BUFFER(info);
+                    if (!b) {
+                        return GST_PAD_PROBE_OK;
+                    }
+                    // Anchor the RTP timeline where the build-time anchor would
+                    // have put it had the first audio arrived at once -- see
+                    // above.  The payloader counts samples from there, so one
+                    // fixed shift keeps every later timestamp contiguous.
+                    if (!v->anchored || v->rtpShift != 0) {
+                        b = gst_buffer_make_writable(b);
+                        GST_PAD_PROBE_INFO_DATA(info) = b;
+                        GstMapInfo wm;
+                        if (gst_buffer_map(b, &wm, GST_MAP_READWRITE)) {
+                            if (wm.size >= 12) {
+                                guint32 ts = ((guint32)wm.data[4] << 24) |
+                                             ((guint32)wm.data[5] << 16) |
+                                             ((guint32)wm.data[6] << 8) | wm.data[7];
+                                if (!v->anchored) {
+                                    v->anchored = true;
+                                    const guint32 want = (guint32)gst_util_uint64_scale(
+                                        gst_clock_get_time(v->ptp) + (GstClockTime)v->anchorNs,
+                                        AES67::AUDIO_RATE, GST_SECOND);
+                                    v->rtpShift = want - ts;
+                                    LogInfo(VB_MEDIAOUT,
+                                            "AES67 send [%d]: RTP timeline re-anchored at the "
+                                            "first packet (%+.1f ms from the build-time anchor)\n",
+                                            v->instanceId,
+                                            (double)(gint32)v->rtpShift * 1000.0 / AES67::AUDIO_RATE);
+                                }
+                                ts += v->rtpShift;
+                                wm.data[4] = (guint8)(ts >> 24);
+                                wm.data[5] = (guint8)(ts >> 16);
+                                wm.data[6] = (guint8)(ts >> 8);
+                                wm.data[7] = (guint8)ts;
+                            }
+                            gst_buffer_unmap(b, &wm);
+                        }
+                    }
                     // ~1Hz at any ptime; the correction is tens of microseconds
                     // and does not need to be finer.
-                    if (!b || (++v->tick % 250) != 0 || !GST_BUFFER_PTS_IS_VALID(b)) {
+                    if ((++v->tick % 250) != 0 || !GST_BUFFER_PTS_IS_VALID(b)) {
                         return GST_PAD_PROBE_OK;
                     }
                     GstMapInfo m;
@@ -3154,9 +3252,13 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
                     const GstClockTime ptpNow = gst_clock_get_time(v->ptp);
                     // When the sink will put this packet on the wire, expressed
                     // in PTP time so it is comparable with the RTP timestamp.
+                    // A buffer whose render time has already passed is sent as it
+                    // arrives, now, so that is when it goes out.
                     const gint64 txPipe = (gint64)GST_BUFFER_PTS(b) + (gint64)baseT +
                                           v->latency + tsOff;
-                    const gint64 txPtp = (gint64)ptpNow + (txPipe - (gint64)pipeNow);
+                    const bool late = txPipe < (gint64)pipeNow;
+                    const gint64 txPtp = (gint64)ptpNow +
+                                         (late ? 0 : txPipe - (gint64)pipeNow);
                     if (txPtp <= 0) {
                         return GST_PAD_PROBE_OK;
                     }
@@ -3191,6 +3293,11 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
                         if (corr > kSlew) corr = kSlew;
                         if (corr < -kSlew) corr = -kSlew;
                     }
+                    // Transmitting earlier cannot help a packet that is already
+                    // late; it only moves every later one into the past too.
+                    if (late && corr < 0) {
+                        corr = 0;
+                    }
                     if (corr != 0) {
                         g_object_set(sink, "ts-offset", tsOff + corr, NULL);
                     }
@@ -3202,14 +3309,15 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
                     if ((v->tick % 15000) == 0) {
                         LogInfo(VB_MEDIAOUT,
                                 "AES67 send [%d]: servo lead %+.2f ms err %+.2f "
-                                "corr %+.3f ms ts-offset %+.2f ms%s\n",
+                                "corr %+.3f ms ts-offset %+.2f ms%s%s\n",
                                 v->instanceId,
                                 (double)leadNs / GST_MSECOND,
                                 (double)err / GST_MSECOND,
                                 (double)corr / GST_MSECOND,
                                 (double)(tsOff + corr) / GST_MSECOND,
                                 (err > kStepThreshold || err < -kStepThreshold)
-                                    ? " STEP" : "");
+                                    ? " STEP" : "",
+                                late ? " LATE" : "");
                     }
                     if (!v->logged) {
                         v->logged = true;
@@ -3270,14 +3378,57 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
     // survivable: fppd.service sets LimitRTPRIO, but a hand-started fppd or
     // a container without CAP_SYS_NICE will not have it, and the stream is
     // still conformant without it, just with a wider tail.
+    //
+    // The thread is GStreamer's, from a pool it shares with every pipeline,
+    // so it has to be handed back as it was: left at SCHED_FIFO, each rebuild
+    // (config apply, watchdog, PTP step, bus error) put one more pool thread
+    // at FIFO 80 that later media decode or video pipelines could land on,
+    // above the channel output thread (RT 10).  The task that runs the thread
+    // gets a leave callback that drops it back to SCHED_OTHER when the task
+    // stops.
     {
         GstElement* snk = gst_bin_get_by_name(GST_BIN(pipeline), "usink");
         GstPad* kp = snk ? gst_element_get_static_pad(snk, "sink") : nullptr;
         if (kp) {
             gst_pad_add_probe(
                 kp, GST_PAD_PROBE_TYPE_BUFFER,
-                [](GstPad*, GstPadProbeInfo*, gpointer user) -> GstPadProbeReturn {
+                [](GstPad* pad, GstPadProbeInfo*, gpointer user) -> GstPadProbeReturn {
                     const int id = GPOINTER_TO_INT(user);
+                    // The task whose thread carried this buffer: the nearest
+                    // pad upstream that runs one (sinkq's, with sink pacing).
+                    GstTask* task = nullptr;
+                    GstPad* up = gst_pad_get_peer(pad);
+                    for (int hop = 0; up && !task && hop < 16; hop++) {
+                        GST_OBJECT_LOCK(up);
+                        if (GST_PAD_TASK(up)) {
+                            task = GST_TASK(gst_object_ref(GST_PAD_TASK(up)));
+                        }
+                        GST_OBJECT_UNLOCK(up);
+                        if (task) {
+                            break;
+                        }
+                        GstElement* el = gst_pad_get_parent_element(up);
+                        gst_object_unref(up);
+                        up = nullptr;
+                        GstPad* in = el ? gst_element_get_static_pad(el, "sink") : nullptr;
+                        if (el) gst_object_unref(el);
+                        if (in) {
+                            up = gst_pad_get_peer(in);
+                            gst_object_unref(in);
+                        }
+                    }
+                    if (up) gst_object_unref(up);
+                    if (!task) {
+                        // Without a task to hand it back through, don't raise it.
+                        LogWarn(VB_MEDIAOUT, "AES67 send [%d]: pacing thread not raised: "
+                                             "could not find its streaming task\n", id);
+                        return GST_PAD_PROBE_REMOVE;
+                    }
+                    gst_task_set_leave_callback(task, [](GstTask*, GThread*, gpointer) {
+                        struct sched_param param = {};
+                        pthread_setschedparam(pthread_self(), SCHED_OTHER, &param);
+                    }, nullptr, nullptr);
+                    gst_object_unref(task);
                     if (SetThreadRealtimePriority(AES67::SINK_RT_PRIORITY)) {
                         LogInfo(VB_MEDIAOUT,
                                 "AES67 send [%d]: pacing thread raised to "
@@ -3520,6 +3671,9 @@ bool AES67Manager::CreateSendPipeline(const AES67Instance& inst) {
         it->second.pipeline = pipeline;
         it->second.bus = bus;
         it->second.running = true;
+        // The gain in the description is the one when it was built; a change
+        // since then went to the pipelines already in this map, not this one.
+        SetPipelineMasterVolume(pipeline, getVolume());
     }
 
     LogInfo(VB_MEDIAOUT, "AES67 send pipeline [%d] %s started → %s:%d (%dch, %dms ptime)\n",
@@ -3733,6 +3887,15 @@ static GstPadProbeReturn DropBufferProbe(GstPad* pad, GstPadProbeInfo* info, gpo
     }
     remaining->fetch_sub((gint64)dur);
     return GST_PAD_PROBE_DROP;
+}
+
+void AES67Manager::SetMasterVolume(int volume) {
+    std::lock_guard<std::mutex> lock(m_pipelineMutex);
+    for (auto& kv : m_sendPipelines) {
+        if (kv.second.pipeline) {
+            SetPipelineMasterVolume(kv.second.pipeline, volume);
+        }
+    }
 }
 
 void AES67Manager::FlushSendPipelines() {
@@ -4491,7 +4654,8 @@ bool AES67Manager::PollPipelinesWatchdog() {
     // pipeline has nothing else that would ever notice.  The first one
     // rebuilds at once; one that keeps coming back waits 30s, 60s, ... up to
     // 8 minutes between rebuilds, and the count starts over after 10 quiet
-    // minutes.
+    // minutes.  A stream that failed to start at all is never stored, so
+    // nothing above sees it; it is retried on the same backoff.
     {
         const auto now = std::chrono::steady_clock::now();
         std::vector<AES67Pipeline*> errored;
@@ -4505,7 +4669,7 @@ bool AES67Manager::PollPipelinesWatchdog() {
         if (m_errorRebuilds > 0 && now - m_lastErrorRebuild > std::chrono::minutes(10)) {
             m_errorRebuilds = 0;
         }
-        if (!errored.empty()) {
+        if (!errored.empty() || m_failedStarts > 0) {
             const auto wait = std::chrono::seconds(30) * (1 << std::min(std::max(m_errorRebuilds - 1, 0), 4));
             if (needsRebuild || m_errorRebuilds == 0 || now - m_lastErrorRebuild >= wait) {
                 if (!needsRebuild) {
@@ -4516,13 +4680,14 @@ bool AES67Manager::PollPipelinesWatchdog() {
                 for (AES67Pipeline* p : errored) {
                     p->running = false;
                 }
-                LogWarn(VB_MEDIAOUT, "AES67 watchdog: %d pipeline(s) stopped on a bus error\n",
-                        (int)errored.size());
+                LogWarn(VB_MEDIAOUT, "AES67 watchdog: %d pipeline(s) stopped on a bus error, "
+                        "%d failed to start\n",
+                        (int)errored.size(), m_failedStarts);
             } else {
                 LogWarn(VB_MEDIAOUT,
-                        "AES67 watchdog: %d pipeline(s) stopped on a bus error, rebuilding in %llds "
-                        "(error rebuild %d)\n",
-                        (int)errored.size(),
+                        "AES67 watchdog: %d pipeline(s) stopped on a bus error, %d failed to start, "
+                        "rebuilding in %llds (error rebuild %d)\n",
+                        (int)errored.size(), m_failedStarts,
                         (long long)std::chrono::duration_cast<std::chrono::seconds>(
                             wait - (now - m_lastErrorRebuild)).count(),
                         m_errorRebuilds + 1);
@@ -4820,7 +4985,7 @@ void AES67Manager::SAPAnnounceLoop() {
     LogInfo(VB_MEDIAOUT, "AES67 SAP announcer thread started\n");
 
     // Create UDP socket for SAP multicast
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         LogErr(VB_MEDIAOUT, "AES67 SAP: Failed to create socket: %s\n", FPPstrerror(errno));
         return;
@@ -4995,7 +5160,7 @@ void AES67Manager::SAPAnnounceLoop() {
 void AES67Manager::SAPReceiveLoop() {
     LogInfo(VB_MEDIAOUT, "AES67 SAP receiver thread started\n");
 
-    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
     if (sock < 0) {
         LogErr(VB_MEDIAOUT, "AES67 SAP recv: Failed to create socket: %s\n", FPPstrerror(errno));
         return;
@@ -5625,7 +5790,7 @@ std::vector<AES67Manager::TestResult> AES67Manager::RunSelfTest() {
     {
         TestResult r;
         r.testName = "multicast_capability";
-        int sock = socket(AF_INET, SOCK_DGRAM, 0);
+        int sock = OpenSocket(AF_INET, SOCK_DGRAM, 0);
         if (sock >= 0) {
             int reuse = 1;
             setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));

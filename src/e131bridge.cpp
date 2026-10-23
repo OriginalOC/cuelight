@@ -24,6 +24,7 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 #include <algorithm>
+#include <atomic>
 #include <cstdlib>
 #include <errno.h>
 #include <ifaddrs.h>
@@ -48,6 +49,7 @@
 #include "fppversion.h"
 #include "log.h"
 #include "settings.h"
+#include "channeloutput/ChannelOutputSetup.h"
 #include "channeloutput/DDP.h"
 #include "channeloutput/Universe.h"
 #include "channeloutput/channeloutputthread.h"
@@ -57,6 +59,7 @@
 #include "util/GPIOUtils.h"
 
 #include "e131bridge.h"
+#include "SysSocket.h"
 
 #define BRIDGE_INVALID_UNIVERSE_INDEX 0xFFFFFF
 // Cached "looked it up, not configured" marker, distinct from the
@@ -85,6 +88,20 @@ static std::atomic<bool> sourcePriorityEnabled{false};
 // signature.
 static in_addr_t currentArtNetSourceIP = 0;
 static int currentArtNetPacketLen = 0;
+
+// The per-universe counters are bumped by the packet path, and read and reset
+// from the HTTP threads, so every access is a relaxed atomic one: a reset
+// racing an increment was a data race, as was the stats read itself.
+// UniverseEntry keeps plain fields (its layout is shared), hence the builtins.
+static inline void StatAdd(uint32_t& c, uint32_t n) {
+    __atomic_fetch_add(&c, n, __ATOMIC_RELAXED);
+}
+static inline uint32_t StatLoad(const uint32_t& c) {
+    return __atomic_load_n(&c, __ATOMIC_RELAXED);
+}
+static inline void StatStore(uint32_t& c, uint32_t v) {
+    __atomic_store_n(&c, v, __ATOMIC_RELAXED);
+}
 
 // Evaluate whether to accept a packet from the given source for this
 // universe under the priority-aware policy. Updates the entry's active
@@ -124,11 +141,15 @@ static inline bool EvaluateSource(UniverseEntry& entry,
     }
     // Lower-or-equal priority from a different source while the current
     // source is still active; suppress it.
-    entry.suppressedPackets++;
+    StatAdd(entry.suppressedPackets, 1);
     return false;
 }
 
 #define MAX_MSG 64
+// Batches of MAX_MSG read per wakeup.  The sockets are level-triggered, so
+// what is left is read on the next pass; draining until empty let a sender
+// faster than fppd keep the main loop in here for good.
+static constexpr int MAX_BATCHES_PER_WAKEUP = 64;
 #define BUFSIZE 1500
 static struct mmsghdr msgs[MAX_MSG];
 static struct iovec iovecs[MAX_MSG];
@@ -157,20 +178,20 @@ static std::vector<std::shared_ptr<UniverseEntry>> DMXInputs;
 // the HTTP server's worker threads; without this a stats poll during a config
 // reload reads a vector mid-rebuild. The packet path runs on the same
 // main-loop thread as every mutation, so it deliberately does NOT take this -
-// torn stat counters in a reader are acceptable, a freed vector is not.
+// a freed vector is the danger, not a counter being bumped meanwhile.
 static std::mutex universesStructureLock;
 
-static uint64_t ddpBytesReceived = 0;
-static uint32_t ddpPacketsReceived = 0;
-static uint32_t ddpErrors = 0;
+static std::atomic<uint64_t> ddpBytesReceived{0};
+static std::atomic<uint32_t> ddpPacketsReceived{0};
+static std::atomic<uint32_t> ddpErrors{0};
 
 static uint32_t ddpLastSequence = 0;
 static uint32_t ddpLastChannel = 0;
 static uint32_t ddpMinChannel = 0xFFFFFFF;
 static uint32_t ddpMaxChannel = 0;
 
-static uint32_t e131Errors = 0;
-static uint32_t e131SyncPackets = 0;
+static std::atomic<uint32_t> e131Errors{0};
+static std::atomic<uint32_t> e131SyncPackets{0};
 static UniverseEntry unknownUniverse;
 
 // Sync universes we've auto-joined the multicast group for, based on the
@@ -280,13 +301,13 @@ inline void CommitBridgeData();
 // of packets), and the main loop can stall for a frame or two doing output
 // processing before it drains the socket. If the receive buffer is too small
 // the kernel tail-drops that burst. A plain SO_RCVBUF request is silently
-// clamped to net.core.rmem_max, so scale the request to the configured universe
-// count and try SO_RCVBUFFORCE first (fppd runs as root, so CAP_NET_ADMIN lets
-// it bypass rmem_max); fall back to the clamped SO_RCVBUF otherwise.
-static void SetBridgeReceiveBufferSize(int sock) {
-    // ~4KB/universe leaves several frames of burst headroom even after the
+// clamped to net.core.rmem_max, so scale the request to the packets in a frame
+// and try SO_RCVBUFFORCE first (fppd runs as root, so CAP_NET_ADMIN lets it
+// bypass rmem_max); fall back to the clamped SO_RCVBUF otherwise.
+static void SetBridgeReceiveBufferSize(int sock, long packetsPerFrame) {
+    // ~4KB/packet leaves several frames of burst headroom even after the
     // kernel's per-packet accounting overhead; clamp to a floor and ceiling.
-    long desired = (long)InputUniverseCount * 4096;
+    long desired = packetsPerFrame * 4096;
     if (desired < 512 * 1024) {
         desired = 512 * 1024;
     } else if (desired > 16 * 1024 * 1024) {
@@ -306,6 +327,27 @@ static void SetBridgeReceiveBufferSize(int sock) {
     if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF, &actual, &len) == 0) {
         LogDebug(VB_E131BRIDGE, "Bridge socket %d recv buffer: requested %d, granted %d\n",
                  sock, bufSize, actual);
+    }
+}
+
+// E1.31 and ArtNet send a packet per configured input universe.  DDP input
+// is not configured by universe -- it lands anywhere in the channel buffer --
+// so a box fed only DDP counted no universes and got the floor, about 450
+// full packets: two frames of a few hundred thousand channels.  A sender
+// sends the channels the outputs here use, up to 1440 to a packet, so count
+// the packets that cover each output range.
+static long DDPPacketsPerFrame() {
+    long packets = 0;
+    auto ranges = GetOutputRangesSnapshot();
+    for (const auto& r : *ranges) {
+        packets += ((long)r.second + 1439) / 1440;
+    }
+    return packets;
+}
+
+void Bridge_OutputRangesChanged() {
+    if (ddpSock >= 0) {
+        SetBridgeReceiveBufferSize(ddpSock, DDPPacketsPerFrame());
     }
 }
 
@@ -358,7 +400,7 @@ int CreateArtNetSocket(uint32_t sourceAddr, bool allowPortChange) {
         return -1;
     };
 
-    int artnetSockT = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+    int artnetSockT = OpenSocket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     if (artnetSockT < 0) {
         // As for a failed bind below: run without ArtNet, don't exit().
         return failed(std::string("ArtNet is off: could not create its socket (") + FPPstrerror(errno) + ")");
@@ -372,7 +414,7 @@ int CreateArtNetSocket(uint32_t sourceAddr, bool allowPortChange) {
 #else
     setsockopt(artnetSockT, SOL_SOCKET, SO_NO_CHECK, (void*)&enable, sizeof enable);
 #endif
-    SetBridgeReceiveBufferSize(artnetSockT);
+    SetBridgeReceiveBufferSize(artnetSockT, InputUniverseCount);
     int bufSize = 512 * 1024;
     setsockopt(artnetSockT, SOL_SOCKET, SO_SNDBUF, &bufSize, sizeof(bufSize));
 
@@ -656,11 +698,12 @@ bool Bridge_ReceiveE131Data(void) {
     bool sync = false;
     long long packetTime = GetTimeMS();
     int msgcnt = recvmmsg(bridgeSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
+    int batches = 1;
     while (msgcnt > 0) {
         for (int x = 0; x < msgcnt; x++) {
             sync |= Bridge_StoreData((uint8_t*)buffers[x], packetTime, msgs[x].msg_len);
         }
-        msgcnt = recvmmsg(bridgeSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
+        msgcnt = ++batches > MAX_BATCHES_PER_WAKEUP ? 0 : recvmmsg(bridgeSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
     }
     CommitBridgeData();
     return sync;
@@ -668,19 +711,21 @@ bool Bridge_ReceiveE131Data(void) {
 bool Bridge_ReceiveDDPData(void) {
     //    LogExcess(VB_E131BRIDGE, "Bridge_ReceiveData()\n");
     int msgcnt = recvmmsg(ddpSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
+    int batches = 1;
     bool sync = false;
     long long packetTime = GetTimeMS();
     while (msgcnt > 0) {
         for (int x = 0; x < msgcnt; x++) {
             sync |= Bridge_StoreDDPData((uint8_t*)buffers[x], packetTime, msgs[x].msg_len);
         }
-        msgcnt = recvmmsg(ddpSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
+        msgcnt = ++batches > MAX_BATCHES_PER_WAKEUP ? 0 : recvmmsg(ddpSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
     }
     CommitBridgeData();
     return sync;
 }
 bool Bridge_ReceiveArtNetData(void) {
     int msgcnt = recvmmsg(artnetSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
+    int batches = 1;
     bool sync = false;
     long long packetTime = GetTimeMS();
     while (msgcnt > 0) {
@@ -703,7 +748,7 @@ bool Bridge_ReceiveArtNetData(void) {
                 sync |= cb->second(bridgeBuffer, packetTime);
             }
         }
-        msgcnt = recvmmsg(artnetSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
+        msgcnt = ++batches > MAX_BATCHES_PER_WAKEUP ? 0 : recvmmsg(artnetSock, msgs, MAX_MSG, MSG_DONTWAIT, nullptr);
     }
     CommitBridgeData();
     return sync;
@@ -718,8 +763,8 @@ bool Bridge_ReceiveArtNetData(void) {
 static constexpr int WARNING_ID_BRIDGE_PORT = 72;
 static std::vector<std::string> bridgePortWarnings;
 
-static int OpenBridgeSocket(const char* what, int port) {
-    int sock = socket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
+static int OpenBridgeSocket(const char* what, int port, long packetsPerFrame) {
+    int sock = OpenSocket(AF_INET, SOCK_DGRAM | SOCK_NONBLOCK, 0);
     const char* step = "socket";
     if (sock >= 0) {
         struct sockaddr_in addr;
@@ -728,7 +773,7 @@ static int OpenBridgeSocket(const char* what, int port) {
         addr.sin_addr.s_addr = htonl(INADDR_ANY);
         addr.sin_port = htons(port);
         if (bind(sock, (struct sockaddr*)&addr, sizeof(addr)) == 0) {
-            SetBridgeReceiveBufferSize(sock);
+            SetBridgeReceiveBufferSize(sock, packetsPerFrame);
             return sock;
         }
         step = "bind";
@@ -779,16 +824,8 @@ bool Bridge_Initialize_Internal(bool& hasArtNet) {
     LogInfo(VB_E131BRIDGE, "Universe Count = %d\n", InputUniverseCount);
     InputUniversesPrint();
 
-    // FIXME FIXME FIXME FIXME
-    // This is a total hack to get a file descriptor greater than 2
-    // because otherwise, the bind() call later will fail for some reason.
-    // FIXME FIXME FIXME FIXME
-    int i1 = socket(AF_INET, SOCK_DGRAM, 0);
-    int i2 = socket(AF_INET, SOCK_DGRAM, 0);
-    int i3 = socket(AF_INET, SOCK_DGRAM, 0);
-
     if (enabled || !disableFakeBridges) {
-        ddpSock = OpenBridgeSocket("DDP", DDP_PORT);
+        ddpSock = OpenBridgeSocket("DDP", DDP_PORT, DDPPacketsPerFrame());
     }
 
     hasArtNet = false;
@@ -807,7 +844,7 @@ bool Bridge_Initialize_Internal(bool& hasArtNet) {
         int UniverseOctet[2];
         struct ip_mreq mreq;
         char strMulticastGroup[16];
-        bridgeSock = OpenBridgeSocket("E1.31", E131_DEST_PORT);
+        bridgeSock = OpenBridgeSocket("E1.31", E131_DEST_PORT, InputUniverseCount);
 
         // get all the addresses
         struct ifaddrs *interfaces, *tmp;
@@ -864,13 +901,6 @@ bool Bridge_Initialize_Internal(bool& hasArtNet) {
     if (hasArtNet) {
         CreateArtNetSocket();
     }
-
-    if (i1 >= 0)
-        close(i1);
-    if (i2 >= 0)
-        close(i2);
-    if (i3 >= 0)
-        close(i3);
 
     return enabled;
 }
@@ -933,17 +963,17 @@ bool Bridge_StoreData(uint8_t* bridgeBuffer, long long packetTime, int msgLen) {
             }
 
             uint32_t sn = bridgeBuffer[E131_SEQUENCE_INDEX];
-            if (!sourceJustSwitched && InputUniverses[universeIndex].packetsReceived != 0) {
-                if (InputUniverses[universeIndex].lastSequenceNumber == 255) {
+            if (!sourceJustSwitched && StatLoad(InputUniverses[universeIndex].packetsReceived) != 0) {
+                if (StatLoad(InputUniverses[universeIndex].lastSequenceNumber) == 255) {
                     // some wrap from 255 -> 1 and some from 255 -> 0, spec doesn't say which
                     if (sn != 0 && sn != 1) {
-                        ++InputUniverses[universeIndex].errorPackets;
+                        StatAdd(InputUniverses[universeIndex].errorPackets, 1);
                     }
-                } else if ((InputUniverses[universeIndex].lastSequenceNumber + 1) != sn) {
-                    ++InputUniverses[universeIndex].errorPackets;
+                } else if ((StatLoad(InputUniverses[universeIndex].lastSequenceNumber) + 1) != sn) {
+                    StatAdd(InputUniverses[universeIndex].errorPackets, 1);
                 }
             }
-            InputUniverses[universeIndex].lastSequenceNumber = sn;
+            StatStore(InputUniverses[universeIndex].lastSequenceNumber, sn);
 
             // Only store what the packet actually carries: the smaller of the
             // configured universe size, the bytes physically received, and the
@@ -960,14 +990,14 @@ bool Bridge_StoreData(uint8_t* bridgeBuffer, long long packetTime, int msgLen) {
                           InputUniverses[universeIndex].startAddress - 1,
                           dataLen,
                           packetTime);
-            InputUniverses[universeIndex].bytesReceived += dataLen;
-            InputUniverses[universeIndex].packetsReceived++;
+            StatAdd(InputUniverses[universeIndex].bytesReceived, dataLen);
+            StatAdd(InputUniverses[universeIndex].packetsReceived, 1);
         } else {
-            unknownUniverse.packetsReceived++;
+            StatAdd(unknownUniverse.packetsReceived, 1);
             uint32_t len = bridgeBuffer[16] & 0xF;
             len <<= 8;
             len += bridgeBuffer[17];
-            unknownUniverse.bytesReceived += len;
+            StatAdd(unknownUniverse.bytesReceived, len);
             LogDebug(VB_E131BRIDGE, "Received e1.31 data packet for unconfigured universe %d\n", universe);
         }
     } else if (bridgeBuffer[E131_VECTOR_INDEX] == VECTOR_ROOT_E131_EXTENDED &&
@@ -1023,19 +1053,19 @@ bool Bridge_StoreArtNetData(uint8_t* bridgeBuffer, long long packetTime) {
                 }
             }
 
-            if (!sourceJustSwitched && InputUniverses[universeIndex].packetsReceived != 0) {
-                if (InputUniverses[universeIndex].lastSequenceNumber == 255) {
+            if (!sourceJustSwitched && StatLoad(InputUniverses[universeIndex].packetsReceived) != 0) {
+                if (StatLoad(InputUniverses[universeIndex].lastSequenceNumber) == 255) {
                     // some wrap from 255 -> 1 and some from 255 -> 0
                     if (sn != 0 && sn != 1) {
-                        ++InputUniverses[universeIndex].errorPackets;
+                        StatAdd(InputUniverses[universeIndex].errorPackets, 1);
                     }
-                } else if ((InputUniverses[universeIndex].lastSequenceNumber + 1) != sn) {
-                    ++InputUniverses[universeIndex].errorPackets;
+                } else if ((StatLoad(InputUniverses[universeIndex].lastSequenceNumber) + 1) != sn) {
+                    StatAdd(InputUniverses[universeIndex].errorPackets, 1);
                 }
             }
-            InputUniverses[universeIndex].lastSequenceNumber = sn;
-            InputUniverses[universeIndex].bytesReceived += std::min(InputUniverses[universeIndex].size, len);
-            InputUniverses[universeIndex].packetsReceived++;
+            StatStore(InputUniverses[universeIndex].lastSequenceNumber, sn);
+            StatAdd(InputUniverses[universeIndex].bytesReceived, std::min(InputUniverses[universeIndex].size, len));
+            StatAdd(InputUniverses[universeIndex].packetsReceived, 1);
 
             SetBridgeData(&bridgeBuffer[18],
                           InputUniverses[universeIndex].startAddress - 1,
@@ -1043,10 +1073,10 @@ bool Bridge_StoreArtNetData(uint8_t* bridgeBuffer, long long packetTime) {
                           packetTime);
 
         } else {
-            unknownUniverse.packetsReceived++;
+            StatAdd(unknownUniverse.packetsReceived, 1);
             // len already holds the ArtDMX data length (15-bit field), clamped
             // to what was actually received.
-            unknownUniverse.bytesReceived += len;
+            StatAdd(unknownUniverse.bytesReceived, len);
             LogDebug(VB_E131BRIDGE, "Received ArtNet data packet for unconfigured universe %d\n", univ);
         }
     }
@@ -1274,31 +1304,31 @@ void ResetBytesReceived() {
     // Callable from the HTTP server's worker threads.
     std::lock_guard<std::mutex> lg(universesStructureLock);
     for (int i = 0; i < InputUniverseCount; i++) {
-        InputUniverses[i].bytesReceived = 0;
-        InputUniverses[i].packetsReceived = 0;
-        InputUniverses[i].errorPackets = 0;
-        InputUniverses[i].lastSequenceNumber = 0;
-        InputUniverses[i].suppressedPackets = 0;
+        StatStore(InputUniverses[i].bytesReceived, 0);
+        StatStore(InputUniverses[i].packetsReceived, 0);
+        StatStore(InputUniverses[i].errorPackets, 0);
+        StatStore(InputUniverses[i].lastSequenceNumber, 0);
+        StatStore(InputUniverses[i].suppressedPackets, 0);
     }
     for (auto& entry : DMXInputs) {
-        entry->bytesReceived = 0;
-        entry->packetsReceived = 0;
-        entry->errorPackets = 0;
-        entry->lastSequenceNumber = 0;
+        StatStore(entry->bytesReceived, 0);
+        StatStore(entry->packetsReceived, 0);
+        StatStore(entry->errorPackets, 0);
+        StatStore(entry->lastSequenceNumber, 0);
     }
     ddpBytesReceived = 0;
     ddpPacketsReceived = 0;
     ddpErrors = 0;
     e131Errors = 0;
-    unknownUniverse.bytesReceived = 0;
-    unknownUniverse.packetsReceived = 0;
+    StatStore(unknownUniverse.bytesReceived, 0);
+    StatStore(unknownUniverse.packetsReceived, 0);
     e131SyncPackets = 0;
 }
 
 Json::Value GetE131UniverseBytesReceived() {
     // Callable from the HTTP server's worker threads; the lock keeps a config
-    // reload from rebuilding the universe lists under this iteration. Torn
-    // reads of the individual counters are fine.
+    // reload from rebuilding the universe lists under this iteration. The
+    // counters themselves are read atomically (StatLoad).
     std::lock_guard<std::mutex> lg(universesStructureLock);
     Json::Value result;
     Json::Value universes(Json::arrayValue);
@@ -1342,10 +1372,10 @@ Json::Value GetE131UniverseBytesReceived() {
         universe["id"] = InputUniverses[i].universe;
         universe["startChannel"] = InputUniverses[i].startAddress;
 
-        universe["bytesReceived"] = std::to_string(InputUniverses[i].bytesReceived);
-        universe["packetsReceived"] = std::to_string(InputUniverses[i].packetsReceived);
-        universe["errors"] = std::to_string(InputUniverses[i].errorPackets);
-        universe["suppressedPackets"] = std::to_string(InputUniverses[i].suppressedPackets);
+        universe["bytesReceived"] = std::to_string(StatLoad(InputUniverses[i].bytesReceived));
+        universe["packetsReceived"] = std::to_string(StatLoad(InputUniverses[i].packetsReceived));
+        universe["errors"] = std::to_string(StatLoad(InputUniverses[i].errorPackets));
+        universe["suppressedPackets"] = std::to_string(StatLoad(InputUniverses[i].suppressedPackets));
 
         universes.append(universe);
     }
@@ -1355,9 +1385,9 @@ Json::Value GetE131UniverseBytesReceived() {
         universe["id"] = entry->dmxDevice;
         universe["startChannel"] = entry->startAddress;
 
-        universe["bytesReceived"] = std::to_string(entry->bytesReceived);
-        universe["packetsReceived"] = std::to_string(entry->packetsReceived);
-        universe["errors"] = std::to_string(entry->errorPackets);
+        universe["bytesReceived"] = std::to_string(StatLoad(entry->bytesReceived));
+        universe["packetsReceived"] = std::to_string(StatLoad(entry->packetsReceived));
+        universe["errors"] = std::to_string(StatLoad(entry->errorPackets));
         universe["suppressedPackets"] = "-";
 
         universes.append(universe);
@@ -1378,7 +1408,7 @@ Json::Value GetE131UniverseBytesReceived() {
 
         universes.append(universe);
     }
-    if (unknownUniverse.packetsReceived) {
+    if (StatLoad(unknownUniverse.packetsReceived)) {
         Json::Value universe;
 
         universe["id"] = "Ignored";
@@ -1389,12 +1419,12 @@ Json::Value GetE131UniverseBytesReceived() {
         std::string errors = er.str();
 
         std::stringstream ss;
-        ss << unknownUniverse.bytesReceived;
+        ss << StatLoad(unknownUniverse.bytesReceived);
         std::string bytesReceived = ss.str();
         universe["bytesReceived"] = bytesReceived;
 
         std::stringstream pr;
-        pr << unknownUniverse.packetsReceived;
+        pr << StatLoad(unknownUniverse.packetsReceived);
         std::string packetsReceived = pr.str();
         universe["packetsReceived"] = packetsReceived;
 
@@ -1472,6 +1502,7 @@ bool AddWarningForProtocol(int sock, const std::string& protocol) {
         return now - e.second > FAKE_BRIDGE_WARNING_SECONDS * 1000;
     });
     int msgcnt = recvmmsg(sock, msgs, MAX_MSG, 0, nullptr);
+    int batches = 1;
     while (msgcnt > 0) {
         for (int x = 0; x < msgcnt; x++) {
             struct in_addr i = inAddress[x].sin_addr;
@@ -1507,7 +1538,7 @@ bool AddWarningForProtocol(int sock, const std::string& protocol) {
             LogDebug(VB_E131BRIDGE, "%s\n", ne.c_str());
             WarningHolder::AddWarningTimeout(ne, FAKE_BRIDGE_WARNING_SECONDS);
         }
-        msgcnt = recvmmsg(sock, msgs, MAX_MSG, 0, nullptr);
+        msgcnt = ++batches > MAX_BATCHES_PER_WAKEUP ? 0 : recvmmsg(sock, msgs, MAX_MSG, 0, nullptr);
     }
     return false;
 }
@@ -1602,7 +1633,7 @@ static void BridgeReloadDMXInputs() {
                                         commitTime = (ts / 1000) + expireOffSet;
                                         SetBridgeData(&buffer[1], entry->startAddress, std::min(sz - 1, count), commitTime);
                                         entry->lastIndex = sz - 1;
-                                        entry->packetsReceived++;
+                                        StatAdd(entry->packetsReceived, 1);
                                         sz -= 1;
                                     } else if (diff < 3000) {
                                         int num = sz;
@@ -1618,9 +1649,9 @@ static void BridgeReloadDMXInputs() {
                                         entry->lastIndex += sz;
                                     } else {
                                         sz = 0;
-                                        entry->errorPackets++;
+                                        StatAdd(entry->errorPackets, 1);
                                     }
-                                    entry->bytesReceived += sz;
+                                    StatAdd(entry->bytesReceived, sz);
                                     sz = read(i, buffer, sizeof(buffer));
                                 }
                                 if (commitTime) {

@@ -265,7 +265,10 @@ private:
     std::mutex m_videoOverlayModelLock;
     int m_videoOverlayWidth = 0;
     int m_videoOverlayHeight = 0;
-    bool m_hasVideoStream = false;
+    // Read by the channel output thread through the overlay registry
+    // (IsOverlayingVideo(), ProcessVideoOverlay()) while Close() and a removed
+    // video branch clear it, before the output leaves the registry.
+    std::atomic<bool> m_hasVideoStream{false};
     bool m_wasOverlayDisabled = false;
 
     // Latest video frame buffer — written by OnNewVideoSample, read by ProcessVideoOverlay
@@ -328,6 +331,7 @@ private:
         std::condition_variable_any busIdle;
     };
     std::shared_ptr<CallbackGuard> m_cbGuard;
+    GstElement* RefVolumeElement();
     // Connects pad-added (and optionally no-more-pads) on `decoder`, passing a
     // guard reference as the closure data.  Takes no ref on `decoder`.
     void ConnectPadSignals(GstElement* decoder, bool wantNoMorePads);
@@ -405,6 +409,24 @@ private:
 
     // Apply playback rate change via GStreamer instant-rate-change seek
     void ApplyRate(float rate);
+
+    // A video whose sound feeds the output stream: its picture is held back by
+    // the card's queue (AlignPictureToSound()), and a video that turns out to
+    // have no sound hands the stream back from the main loop.
+    void AlignPictureToSound(int64_t latNs);
+    int64_t m_pictureDelayNs = 0;
+    std::atomic<bool> m_pwFeedOrphaned{ false };
+
+    // A MultiSync remote's media through the persistent output stream: held to
+    // the master by the speed of the stream's feed (see AdjustFeedSpeed()).
+    int AdjustFeedSpeed(float masterMediaPosition);
+    double m_feedSpeedErrInt = 0.0;     // integral of the error, s*s
+    uint64_t m_feedSpeedLastMs = 0;     // when the servo last ran
+    uint64_t m_feedResyncMs = 0;        // when the last resync seek was made
+    bool m_feedResyncLanding = false;   // the next error is how far it landed off
+    // How far ahead of the master a resync seek aims: what a flushing seek
+    // takes to be heard again.  Learnt from each landing, for the whole run.
+    static double s_feedResyncLeadS;
 
     int m_streamSlot = 1;  // stream slot number (1-5), determines PipeWire node name
 

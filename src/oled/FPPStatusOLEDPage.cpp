@@ -15,6 +15,7 @@
 #include <unistd.h>
 
 #include "../common.h"
+#include "../CurlSocket.h"
 
 #include "FPPMainMenu.h"
 #include "FPPStatusOLEDPage.h"
@@ -158,6 +159,7 @@ FPPStatusOLEDPage::FPPStatusOLEDPage() :
     _iterationCount(0),
     _hasSensors(false) {
     curl = curl_easy_init();
+    SetCurlCloseOnExec(curl);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
     curl_easy_setopt(curl, CURLOPT_URL, "http://localhost:32322/fppd/status");
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
@@ -357,7 +359,8 @@ int FPPStatusOLEDPage::outputTopPart(int startY, int count) {
             }
         }
     } else {
-        if (count < 60) {
+        // fppd answering means boot is done; past that, no address is "No Network"
+        if (count < 60 && !_fppdSeen) {
             printString(0, startY, "FPP Booting...");
         } else {
             printString(0, startY, "No Network");
@@ -487,6 +490,7 @@ bool FPPStatusOLEDPage::doIteration(bool& displayOn) {
     Json::Value result;
     bool statusValid = getCurrentStatus(result);
     if (statusValid) {
+        _fppdSeen = true;
         if (!displayOn || _lastStatusLines.empty()) {
             displayOn = checkIfStatusChanged(result);
             if (displayOn) {
@@ -644,6 +648,7 @@ void FPPStatusOLEDPage::runTest(const std::string& test, bool ms) {
 
     buffer.clear();
     CURL* curl = curl_easy_init();
+    SetCurlCloseOnExec(curl);
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1);
     curl_easy_setopt(curl, CURLOPT_URL, "http://localhost/api/command");
 

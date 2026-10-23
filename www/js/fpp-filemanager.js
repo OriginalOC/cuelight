@@ -50,13 +50,14 @@ var FPP_OWN_LOGS = [
 	'fppd.log', // the timeline: fppd, init/boot, lifecycle, breadcrumbs
 	'fpp_system_upgrades.log', // FPP + fppos upgrades
 	'fpp_plugin_manager.log', // plugin install/upgrade/uninstall
-	'fpp_backup_filecopy.log' // transient: exists only during a backup
+	'fpp_backup_filecopy.log' // LogBaseName files each backup's progress feed (fpp_backup_filecopy_<id>.log) under this name
 ];
 
 // logrotate leaves fppd.log.1 and fppd.log.2.gz next to fppd.log; those are the
 // same log and belong in the same group, so compare on the base name.
 function LogBaseName (name) {
-	return name.replace(/\.gz$/, '').replace(/\.\d+$/, '');
+	return name.replace(/\.gz$/, '').replace(/\.\d+$/, '')
+		.replace(/^fpp_backup_filecopy_[A-Za-z0-9]+\.log$/, 'fpp_backup_filecopy.log');
 }
 
 // How far back a rotation is: the live log (no numeric suffix) is -1 so it sorts
@@ -120,6 +121,25 @@ function SortLogFiles (files) {
 	});
 }
 
+// The page asks for its first listings from its <head>, so they overlap the
+// rest of the page loading -- which means one can answer before the parser
+// has reached its table, and rows written then go nowhere (the tab stays
+// empty, not even "No files found"). Hold a listing's handlers until the
+// tables exist; once the page has loaded they run at once, as before.
+function AfterTablesParsed (fn) {
+	return function () {
+		var self = this;
+		var args = arguments;
+		if (document.readyState === 'loading') {
+			$(function () {
+				fn.apply(self, args);
+			});
+		} else {
+			fn.apply(self, args);
+		}
+	};
+}
+
 function GetFiles (dir, extraParams, seq) {
 	if (seq === undefined) {
 		// A standalone refresh (rename/copy/save follow-ups, initial Config
@@ -129,7 +149,7 @@ function GetFiles (dir, extraParams, seq) {
 	$.ajax({
 		dataType: 'json',
 		url: 'api/files/' + dir + (extraParams ? '?' + extraParams : ''),
-		success: function (data) {
+		success: AfterTablesParsed(function (data) {
 			let i = 0;
 
 			// Ignore responses from a superseded round: a newer listing for
@@ -294,8 +314,8 @@ function GetFiles (dir, extraParams, seq) {
 					.append(tableRow);
 				++i;
 			});
-		},
-		error: function (x, t, e) {
+		}),
+		error: AfterTablesParsed(function (x, t, e) {
 			// A superseded round failing after a newer one already refreshed
 			// this dir is not worth an error dialog: the listing is current.
 			if ((fileListApplied[dir] || 0) > seq) {
@@ -308,8 +328,8 @@ function GetFiles (dir, extraParams, seq) {
 					' directory' +
 					show_details([x, t, e])
 			);
-		},
-		complete: function () {
+		}),
+		complete: AfterTablesParsed(function () {
 			// A superseded round must not touch the table at all: reaching
 			// SetupTableSorter() would destroy/rebuild for nothing, dropping
 			// the newer listing's view state.
@@ -329,7 +349,7 @@ function GetFiles (dir, extraParams, seq) {
 			} else if (dir == 'Music' || dir == 'Videos') {
 				LoadMediaDurations(dir);
 			}
-		}
+		})
 	});
 }
 
@@ -1101,7 +1121,12 @@ function ClearSelections (table) {
 
 function HandleMouseClick (event, row, table) {
 	HandleTableRowMouseClick(event, row);
+	UpdateSelectionButtons(table);
+}
 
+// Enables the buttons that apply to what is selected in a table, and disables
+// the rest.
+function UpdateSelectionButtons (table) {
 	var selectedCount = $('#tbl' + table + ' tr.selectedEntry').length;
 	var dirCount = $('#tbl' + table + ' tr.selectedEntry.fileIsDirectory').length;
 
@@ -1121,6 +1146,39 @@ function HandleMouseClick (event, row, table) {
 
 function pageSpecific_PageLoad_PostDOMLoad_ActionsSetup () {
 	//setup the pageLoad actions unique for the file manager page
+
+	// The selection is a class on the rendered rows, and Bootstrap Table
+	// renders a table's body again whenever it resets its view -- a dialog
+	// opening and closing is enough -- which dropped the selection while the
+	// buttons stayed enabled for it. Carry the selection across the redraw,
+	// and put the buttons back in step with what is still selected (a filter
+	// can leave a selected row out). Bound on the document, since destroying
+	// a table drops the handlers bound to it.
+	var redrawSelection = {};
+	$(document)
+		.on('pre-body.bs.table', '#fileManager table', function () {
+			redrawSelection[this.id] = $(this)
+				.find('tbody tr.selectedEntry')
+				.map(function () {
+					return $(this).find('td:first').text();
+				})
+				.get();
+		})
+		.on('post-body.bs.table', '#fileManager table', function () {
+			var selected = redrawSelection[this.id] || [];
+			delete redrawSelection[this.id];
+			if (selected.length) {
+				$(this)
+					.find('tbody tr')
+					.each(function () {
+						if (selected.indexOf($(this).find('td:first').text()) != -1) {
+							$(this).addClass('selectedEntry');
+						}
+					});
+			}
+			UpdateSelectionButtons(this.id.substring(3));
+		});
+
 	$('#tblSequences').on('mousedown', 'tbody tr', function (event, ui) {
 		HandleMouseClick(event, $(this), 'Sequences');
 	});
@@ -1476,9 +1534,11 @@ function RunScript (scriptName) {
 	DoModalDialog(options);
 
 	StreamURL(
-		'runEventScript.php?scriptName=' + scriptName + '&nohtml=1',
+		'runEventScript.php?scriptName=' + encodeURIComponent(scriptName) + '&nohtml=1',
 		'runScriptText',
-		'RunScriptDone'
+		'RunScriptDone',
+		'',
+		'POST'
 	);
 }
 

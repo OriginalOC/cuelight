@@ -1098,6 +1098,12 @@ public:
     };
     void FlushSendPipelines();
 
+    // Apply the master volume to every send pipeline.  A sender's PipeWire
+    // node is a capture stream, not a sink, so the master's pactl pass over
+    // the output sinks never reaches it; the gain is a volume element in the
+    // pipeline instead.  New pipelines take it from getVolume() as they start.
+    void SetMasterVolume(int volume);
+
     AES67Manager();
     virtual ~AES67Manager();
 
@@ -1140,6 +1146,12 @@ private:
     // a pidfd always refers to our child, where kill(pid) could hit
     // whatever took the number.
     int m_ptp4lPidfd = -1;
+    // m_ptp4lPid and m_ptp4lPidfd: IsPtp4lRunning() reads them from HTTP
+    // threads (status, self-test) while the main loop starts and stops
+    // ptp4l, and closing the pidfd under a reader polled a closed -- or
+    // reused -- descriptor.  Held only to read or swap them, never across a
+    // wait for the child.
+    mutable std::mutex m_ptp4lProcMutex;
     // ptp4l is running with hardware timestamping, i.e. disciplining the
     // NIC's PHC.  With software timestamping it disciplines CLOCK_REALTIME
     // and leaves the PHC free-running, so only this makes the PHC the
@@ -1349,6 +1361,11 @@ private:
     // ptp4l for the whole domain, so an error that comes straight back must
     // not do that every pass.  Watchdog thread only.
     int m_errorRebuilds = 0;
+    // Streams whose pipeline failed to build or start in the last apply
+    // (PipeWire not up yet, say).  Nothing else would try them again, so the
+    // watchdog rebuilds for them on the bus-error backoff.  Set by
+    // ApplyConfig() under m_pipelineMutex.
+    int m_failedStarts = 0;
     // PTP enabled but not running (its start, or a watchdog restart, failed):
     // when the watchdog tries again, backing off 30s..5min.  Watchdog thread
     // only; reset by a successful start.

@@ -803,6 +803,17 @@ function ParseLastStageMarker (text) {
 function DoModalDialog (options) {
 	var dlg = $('#' + options.id);
 	var isNewDialog = dlg.length == 0;
+	// A new dialog is cloned from #modalDialogBase, which comes in with the
+	// footer at the end of the page. A slow page shows its buttons long before
+	// that, and a dialog opened from one in the meantime (a lookup that answers
+	// quickly) cloned nothing and threw inside bootstrap.Modal. Open it once
+	// the page has finished parsing instead.
+	if (isNewDialog && $('#modalDialogBase').length == 0 && document.readyState === 'loading') {
+		$(function () {
+			DoModalDialog(options);
+		});
+		return;
+	}
 	if (isNewDialog) {
 		dlg = $('#modalDialogBase').clone();
 		dlg.attr('id', options.id);
@@ -2352,6 +2363,14 @@ function HideAllToolTips () {
 	});
 }
 
+// Elements SetupToolTips() has given a tooltip instance.  Bootstrap keeps every
+// instance in a global Map keyed by its element, and its listeners in a global
+// registry, so an element whose instance is never disposed is never freed --
+// nor is the detached subtree it still points at through parentNode.  Pages
+// such as multisync.php rebuild a table and call SetupToolTips() on every
+// status poll, which leaked a whole table every couple of seconds.
+var fppToolTipElements = new Set();
+
 function SetupToolTips (delay = 100) {
 	// Delegated on document so it covers dialogs built long after this sweep,
 	// and namespaced + rebound because several pages call SetupToolTips again
@@ -2361,6 +2380,14 @@ function SetupToolTips (delay = 100) {
 	$(document)
 		.off('show.bs.modal.fppTooltips')
 		.on('show.bs.modal.fppTooltips', HideAllToolTips);
+
+	// Release the instances of elements that have since left the page.
+	fppToolTipElements.forEach(el => {
+		if (!el.isConnected) {
+			bootstrap.Tooltip.getInstance(el)?.dispose();
+			fppToolTipElements.delete(el);
+		}
+	});
 
 	var titles = document.querySelectorAll('[title]');
 
@@ -2376,7 +2403,16 @@ function SetupToolTips (delay = 100) {
 		'[data-bs-toggle="tooltip"]'
 	);
 	const tooltipList = [...tooltipTriggerList].map(tooltipTriggerEl => {
-		let tooltipInstance;
+		let tooltipInstance = bootstrap.Tooltip.getInstance(tooltipTriggerEl);
+		if (tooltipInstance) {
+			// Already set up by an earlier call.  A new title attribute means
+			// the page retitled it, so rebuild it to pick that up; otherwise a
+			// second instance would only orphan the first one's listeners.
+			if (!tooltipTriggerEl.hasAttribute('title')) {
+				return tooltipInstance;
+			}
+			tooltipInstance.dispose();
+		}
 		try {
 			// Bootstrap treats an empty data-bs-title attribute as null and
 			// throws while type-checking the config. A single bad tooltip
@@ -2387,19 +2423,25 @@ function SetupToolTips (delay = 100) {
 			console.warn('Skipping invalid tooltip', tooltipTriggerEl, e);
 			return null;
 		}
+		fppToolTipElements.add(tooltipTriggerEl);
 
-		// Auto-hide tooltip after 3 seconds if mouse is not hovering
-		tooltipTriggerEl.addEventListener('mouseenter', () => {
-			clearTimeout(tooltipTriggerEl.tooltipTimeout);
-		});
+		// Auto-hide tooltip after 3 seconds if mouse is not hovering.  Bound
+		// once per element, looking the instance up when it fires, because a
+		// retitled element gets a new instance above.
+		if (!tooltipTriggerEl.fppToolTipAutoHide) {
+			tooltipTriggerEl.fppToolTipAutoHide = true;
+			tooltipTriggerEl.addEventListener('mouseenter', () => {
+				clearTimeout(tooltipTriggerEl.tooltipTimeout);
+			});
 
-		tooltipTriggerEl.addEventListener('mouseleave', () => {
-			tooltipTriggerEl.tooltipTimeout = setTimeout(() => {
-				if (!tooltipTriggerEl.matches(':hover')) {
-					tooltipInstance.hide();
-				}
-			}, 3000);
-		});
+			tooltipTriggerEl.addEventListener('mouseleave', () => {
+				tooltipTriggerEl.tooltipTimeout = setTimeout(() => {
+					if (!tooltipTriggerEl.matches(':hover')) {
+						bootstrap.Tooltip.getInstance(tooltipTriggerEl)?.hide();
+					}
+				}, 3000);
+			});
+		}
 
 		return tooltipInstance;
 	});
@@ -4873,7 +4915,8 @@ function UpgradeFPPVersion (newVersion) {
 			'upgradefpp.php?version=v' + version,
 			'upgradeFPPDialogText',
 			'VersionUpgradeDone',
-			'VersionUpgradeDone'
+			'VersionUpgradeDone',
+			'POST'
 		);
 	}
 }
@@ -4904,8 +4947,9 @@ function ChangeGitBranch (newBranch) {
 					"') branch?  This may take some time and it may not be fully compatible with this FPP OS version.  Click 'OK' to continue."
 			)
 		) {
-			location.href =
-				'changebranch.php?branch=' + encodeURIComponent(newBranch) + '&remote=pull-requests&pr=' + encodeURIComponent(prNum);
+			PostNavigate(
+				'changebranch.php?branch=' + encodeURIComponent(newBranch) + '&remote=pull-requests&pr=' + encodeURIComponent(prNum)
+			);
 		} else {
 			location.reload(true);
 		}
@@ -4918,15 +4962,16 @@ function ChangeGitBranch (newBranch) {
 				"' branch?  This may take some time and it may not be fully compatible with this FPP OS version.  Click 'OK' to continue."
 		)
 	) {
-		location.href =
-			'changebranch.php?branch=' + encodeURIComponent(newBranch) + '&remote=' + encodeURIComponent(remote);
+		PostNavigate(
+			'changebranch.php?branch=' + encodeURIComponent(newBranch) + '&remote=' + encodeURIComponent(remote)
+		);
 	} else {
 		location.reload(true);
 	}
 }
 
 function RebuildFPPSource () {
-	location.href = 'rebuildfpp.php';
+	PostNavigate('rebuildfpp.php');
 }
 
 // Single source of truth for the per-row fields in the universe output/input
@@ -5451,7 +5496,7 @@ function populateUniverseData (data, reload, input) {
 			PacingRateOptionsHTML(pacingRateVal) +
 			'</select></td>';
 		bodyHTML +=
-			'<td ' +
+			"<td class='text-center' " +
 			inputStyle +
 			"><input class='txtMonitor' id='txtMonitor' type='checkbox' size='4' maxlength='4' " +
 			(monitor == 1 ? 'checked' : '') +
@@ -5518,10 +5563,22 @@ function getUniverses (reload, input) {
 	if (input) {
 		url = 'api/channel/output/universeInputs';
 	}
+	// Save stays off until the saved config is on the page: before that the
+	// page shows no universes and output disabled, and saving that wipes it.
+	var save = $('#frmUniverses input[type=submit]');
+	save.prop('disabled', true);
 	$.getJSON(url, function (data) {
 		populateUniverseData(data, reload, input);
 		SetUniverseInputShownFields(); // hide fields based on output type
-	}).fail(function () {
+		save.prop('disabled', false);
+	}).fail(function (jqXHR) {
+		if (jqXHR.status != 404) {
+			$.jGrowl(
+				'Unable to load the universe configuration, so Save is disabled to keep it from being overwritten.  Reload the page to try again.',
+				{ themeState: 'danger', sticky: true }
+			);
+			return;
+		}
 		// no config saved yet; still need the Sending options set up to
 		// match the default pacing selection
 		UniverseCount = 0;
@@ -5529,7 +5586,14 @@ function getUniverses (reload, input) {
 		if (!input) {
 			UpdateSendingModeOptions();
 		}
+		save.prop('disabled', false);
 	});
+}
+
+// Save is disabled while getUniverses() loads, but Enter in a field submits
+// the form whatever state its button is in.
+function UniverseSaveAllowed () {
+	return !$('#frmUniverses input[type=submit]').prop('disabled');
 }
 
 function SetUniverseRowInputNames (row, id) {
@@ -6034,8 +6098,7 @@ function validateNumber (textbox, minimum, maximum) {
 }
 
 function StartNextScheduledItemNow () {
-	var url = 'api/command/Start Next Scheduled Item';
-	$.get(url)
+	PostCommand('Start Next Scheduled Item')
 		.done(function (data) {
 			$.jGrowl(data, { themeState: 'success' });
 		})
@@ -6048,8 +6111,7 @@ function StartNextScheduledItemNow () {
 
 function ExtendSchedule (minutes) {
 	var seconds = minutes * 60;
-	var url = 'api/command/Extend Schedule/' + seconds;
-	$.get(url)
+	PostCommand('Extend Schedule', [seconds])
 		.done(function (data) {
 			$.jGrowl(data, { themeState: 'success' });
 		})
@@ -6268,7 +6330,7 @@ function show_details (args) {
 }
 
 function moveFile (file, callback = null) {
-	$.get('api/file/move/' + encodeURIComponent(file))
+	$.post('api/file/move/' + encodeURIComponent(file))
 		.done(function (data) {
 			if ('OK' != data.status) {
 				DialogError('File Move Error', data.status);
@@ -7469,30 +7531,25 @@ function UpdateCurrentEntryPlaying (index, lastIndex) {
 function SetIconForCurrentPlayingEntry (index) {}
 
 function StopGracefully () {
-	var url = 'api/playlists/stopgracefully';
-	$.get(url)
+	$.post('api/playlists/stopgracefully')
 		.done(function () {})
 		.fail(function () {});
 }
 
 function StopGracefullyAfterLoop () {
-	var url = 'api/playlists/stopgracefullyafterloop';
-	$.get(url)
+	$.post('api/playlists/stopgracefullyafterloop')
 		.done(function () {})
 		.fail(function () {});
 }
 
 function StopNow () {
-	var url = 'api/playlists/stop';
-	$.get(url)
+	$.post('api/playlists/stop')
 		.done(function () {})
 		.fail(function () {});
 }
 
 function ToggleSequencePause () {
-	var url = 'api/sequence/current/togglePause';
-
-	$.get(url)
+	$.post('api/sequence/current/togglePause')
 		.done(function () {
 			$.jGrowl('Pause/Resume', { themeState: 'success' });
 		})
@@ -7931,7 +7988,7 @@ function RestartFPPD () {
 
 	clearTimeout(statusTimeout);
 	$('html,body').css('cursor', 'wait');
-	$.get('api/system/fppd/restart' + args)
+	$.post('api/system/fppd/restart' + args)
 		.done(function () {
 			$('html,body').css('cursor', 'auto');
 			$.jGrowl('FPPD Restarted', { themeState: 'success' });
@@ -8057,9 +8114,9 @@ function PopulatePlaylists (sequencesAlso, options) {
 			for (let j = 0; j < playListArray.length; j++) {
 				playlistOptionsText +=
 					'<option value="' +
-					playListArray[j].name +
+					EscapeHtmlAttr(playListArray[j].name) +
 					'">' +
-					playListArray[j].name +
+					EscapeHtmlAttr(playListArray[j].name) +
 					'</option>';
 			}
 			if (sequencesAlso) {
@@ -8067,18 +8124,18 @@ function PopulatePlaylists (sequencesAlso, options) {
 				for (let j = 0; j < sequenceArray.length; j++) {
 					playlistOptionsText +=
 						'<option value="' +
-						sequenceArray[j] +
+						EscapeHtmlAttr(sequenceArray[j]) +
 						'.fseq">' +
-						sequenceArray[j] +
+						EscapeHtmlAttr(sequenceArray[j]) +
 						'.fseq</option>';
 				}
 				playlistOptionsText += '</optgroup><optgroup label="Media">';
 				for (let j = 0; j < mediaArray.length; j++) {
 					playlistOptionsText +=
 						'<option value="' +
-						mediaArray[j] +
+						EscapeHtmlAttr(mediaArray[j]) +
 						'">' +
-						mediaArray[j] +
+						EscapeHtmlAttr(mediaArray[j]) +
 						'</option>';
 				}
 				playlistOptionsText += '</optgroup>';
@@ -8162,12 +8219,7 @@ function PlayPlaylist (Playlist, goToStatus = 0) {
 		settings.hasOwnProperty('UIStartedPlaylistsProtected') &&
 		settings['UIStartedPlaylistsProtected'] == '1';
 
-	var url =
-		'api/command/Start Playlist/' +
-		Playlist +
-		'/0/false/' +
-		(scheduleProtected ? 'true' : 'false');
-	$.get(url)
+	PostCommand('Start Playlist', [Playlist, 0, false, scheduleProtected])
 		.done(function () {
 			if (goToStatus) location.href = 'index.php';
 			else $.jGrowl('Playlist Started', { themeState: 'success' });
@@ -8395,7 +8447,7 @@ function RebootFPP () {
 
 	// Delay reboot for 1 second to allow flags to be cleared
 	setTimeout(function () {
-		$.get({
+		$.post({
 			url: 'api/system/reboot',
 			data: '',
 			success: function (data) {
@@ -8452,7 +8504,7 @@ function Shutdown () {
 }
 
 function ShutdownFPP () {
-	$.get({
+	$.post({
 		url: 'api/system/shutdown',
 		data: '',
 		success: function (data) {
@@ -9890,8 +9942,15 @@ function DeleteFile (dir, row, file, silent = false) {
 					);
 			}
 		})
-		.fail(function () {
-			if (!silent) DialogError('ERROR', 'Error deleting file: ' + file);
+		.fail(function (xhr) {
+			// A refusal (missing file, a path outside the directory) carries
+			// its reason in the body, as an OK-status reply used to.
+			var reason = xhr.responseJSON && xhr.responseJSON.status;
+			if (!silent)
+				DialogError(
+					'ERROR',
+					'Error deleting file "' + file + '"' + (reason ? ': ' + reason : '')
+				);
 		});
 }
 
@@ -13448,22 +13507,23 @@ function PrintArgsInputsForEditable (
 				url: OverlayModelContentListUrl(val['contentListUrl']),
 				async: false,
 				success: function (data) {
+					// The lists are playlist, file and other stored names.
 					if (Array.isArray(data)) {
 						$.each(data, function (key, v) {
-							var line = '<option value="' + v + '"';
+							var line = '<option value="' + EscapeHtmlAttr(v) + '"';
 							if (v == dv) {
 								line += ' selected';
 							}
-							line += '>' + v + '</option>';
+							line += '>' + EscapeHtmlAttr(v) + '</option>';
 							$(selId).append(line);
 						});
 					} else {
 						$.each(data, function (key, v) {
-							var line = '<option value="' + key + '"';
+							var line = '<option value="' + EscapeHtmlAttr(key) + '"';
 							if (key == dv) {
 								line += ' selected';
 							}
-							line += '>' + v + '</option>';
+							line += '>' + EscapeHtmlAttr(v) + '</option>';
 							$(selId).append(line);
 						});
 					}
@@ -14181,14 +14241,11 @@ function PrintArgInputs (tblCommand, configAdjustable, args, startCount = 1) {
 							if (filterSequences.length > 0 && filterSequences.includes(v)) {
 								return true; // continue to next iteration
 							}
-							var line = '<option value="' + v.replace('"', '&quot;') + '"';
+							var line = '<option value="' + EscapeHtmlAttr(v) + '"';
 							if (v == dv) {
 								line += ' selected';
 							}
-							line +=
-								'>' +
-								v.replace(/&/g, '&amp;').replace(/</g, '&lt;') +
-								'</option>';
+							line += '>' + EscapeHtmlAttr(v) + '</option>';
 							$(selId).append(line);
 						});
 					} else {
@@ -14197,14 +14254,11 @@ function PrintArgInputs (tblCommand, configAdjustable, args, startCount = 1) {
 							if (filterSequences.length > 0 && filterSequences.includes(key)) {
 								return true; // continue to next iteration
 							}
-							var line = '<option value="' + key.replace('"', '&quot;') + '"';
+							var line = '<option value="' + EscapeHtmlAttr(key) + '"';
 							if (key == dv) {
 								line += ' selected';
 							}
-							line +=
-								'>' +
-								v.replace(/&/g, '&amp;').replace(/</g, '&lt;') +
-								'</option>';
+							line += '>' + EscapeHtmlAttr(v) + '</option>';
 							$(selId).append(line);
 						});
 					}
@@ -14957,6 +15011,29 @@ function RunCommandJSON (cmdJSON) {
 
 function RunCommand (cmd) {
 	RunCommandJSON(JSON.stringify(cmd));
+}
+
+// Run a command by POST api/command, the form FPP 11 requires; GET
+// api/command/<name>/<args> is deprecated (docs/DEPRECATED.md). Returns the
+// jqXHR, for .done()/.fail().
+function PostCommand (command, args = []) {
+	return $.ajax({
+		url: 'api/command',
+		type: 'POST',
+		contentType: 'application/json',
+		data: JSON.stringify({ command: command, args: args })
+	});
+}
+
+// Open a page that changes state (changebranch.php, rebuildfpp.php) by POST,
+// which FPP 11 requires of it (docs/DEPRECATED.md). Its parameters stay in the
+// query string, where the page reads them.
+function PostNavigate (url) {
+	var form = document.createElement('form');
+	form.method = 'POST';
+	form.action = url;
+	document.body.appendChild(form);
+	form.submit();
 }
 
 function RunCommandSaved (item, data) {
@@ -15851,11 +15928,12 @@ function BuildPluginHeaderIndicator (indicator) {
 }
 
 /*
- * The player badge's tooltip is rendered as HTML (data-bs-html), and its markup
- * travels in a title="..." attribute.  The browser decodes one level of
- * escaping when it parses the attribute, so the HTML -- whose filenames were
- * already escaped as content -- has to be escaped once more here.  Escaping
- * only once would hand the raw filename to the tooltip's HTML renderer.
+ * The header's tooltips (the player badge's, the interfaces') are rendered as
+ * HTML (data-bs-html), and their markup travels in a title="..." attribute.
+ * The browser decodes one level of escaping when it parses the attribute, so
+ * the HTML -- whose filenames and names were already escaped as content -- has
+ * to be escaped once more here.  Escaping only once would hand the raw name to
+ * the tooltip's HTML renderer.
  */
 function EscapeHeaderTooltipAttr (html) {
 	return EscapeHtml(html).replace(/"/g, '&quot;');
@@ -15930,6 +16008,9 @@ function RefreshHeaderBar () {
 			if (e.ifname.startsWith('can.')) {
 				return 0;
 			}
+			// Everything below goes into markup (and the tooltips render theirs
+			// as HTML), so the interface's fields are escaped as they're added.
+			var ifname = EscapeHtmlAttr(e.ifname);
 
 			if (!e.flags.some(flag => flag === 'NO-CARRIER')) {
 				// Show up interfaces even if they do not have IP configured - eg Colorlight
@@ -15938,15 +16019,15 @@ function RefreshHeaderBar () {
 						var icon = 'text-success';
 						var row =
 							'<span ifname="' +
-							e.ifname +
-							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="IP: ' +
-							e.local +
+							ifname +
+							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="' +
+							EscapeHeaderTooltipAttr('IP: ' + EscapeHtml(e.local)) +
 							'" ><i class="fas fa-network-wired ' +
 							icon +
 							'"></i><small>' +
-							e.ifname +
+							ifname +
 							'<div class="divIPAddress">: ' +
-							e.local +
+							EscapeHtml(e.local) +
 							'</div></small></span>';
 						rc.push(row);
 					}
@@ -15962,35 +16043,38 @@ function RefreshHeaderBar () {
 						var ipWithCIDR = formatIPWithCIDR(n.local, n.prefixlen);
 						var row =
 							'<span ifname="' +
-							e.ifname +
-							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="Tether IP: ' +
-							ipWithCIDR +
+							ifname +
+							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="' +
+							EscapeHeaderTooltipAttr('Tether IP: ' + EscapeHtml(ipWithCIDR)) +
 							'"><i class="fas fa-broadcast-tower"></i><small>' +
-							e.ifname +
+							ifname +
 							'<div class="divIPAddress">: ' +
-							n.local +
+							EscapeHtml(n.local) +
 							'</div></small></span>';
 						rc.push(row);
 					} else if (n.family === 'inet' && 'wifi' in e) {
 						var ipWithCIDR = formatIPWithCIDR(n.local, n.prefixlen);
 						var row =
 							'<span ifname="' +
-							e.ifname +
-							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="IP: ' +
-							ipWithCIDR +
-							'<br/>Strength: ' +
-							e.wifi.level +
-							e.wifi.unit +
+							ifname +
+							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="' +
+							EscapeHeaderTooltipAttr(
+								'IP: ' +
+									EscapeHtml(ipWithCIDR) +
+									'<br/>Strength: ' +
+									EscapeHtml(e.wifi.level) +
+									EscapeHtml(e.wifi.unit)
+							) +
 							'">';
 						row +=
 							'<img title="WiFi Strength" src="images/redesign/wifi-' +
-							e.wifi.desc +
+							EscapeHtmlAttr(e.wifi.desc) +
 							'.svg" height="14px"/>';
 						row +=
 							'<small>' +
-							e.ifname +
+							ifname +
 							'<div class="divIPAddress">: ' +
-							n.local +
+							EscapeHtml(n.local) +
 							'</div></small></span>';
 						rc.push(row);
 					} else if (n.family === 'inet') {
@@ -16003,15 +16087,15 @@ function RefreshHeaderBar () {
 						var ipWithCIDR = formatIPWithCIDR(n.local, n.prefixlen);
 						var row =
 							'<span ifname="' +
-							e.ifname +
-							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="IP: ' +
-							ipWithCIDR +
+							ifname +
+							'" class="ipTooltip" data-bs-toggle="tooltip" data-bs-html="true" data-bs-placement="bottom" data-bs-title="' +
+							EscapeHeaderTooltipAttr('IP: ' + EscapeHtml(ipWithCIDR)) +
 							'" ><i class="fas fa-network-wired ' +
 							icon +
 							'"></i><small>' +
-							e.ifname +
+							ifname +
 							'<div class="divIPAddress">: ' +
-							n.local +
+							EscapeHtml(n.local) +
 							'</div></small></span>';
 						rc.push(row);
 					}
@@ -16036,9 +16120,11 @@ function RefreshHeaderBar () {
 			return s.valueType !== 'FanSpeed';
 		});
 		var tooltip = '';
-		// Tooltip shows all sensors (including fans)
+		// Tooltip shows all sensors (including fans).  Labels and readings come
+		// from cape EEPROMs and sensors.json, so they're escaped into its HTML
+		// and into the header spans below.
 		data.sensors.forEach(function (e) {
-			var tv = e.formatted;
+			var tv = EscapeHtml(e.formatted);
 			if (
 				e.valueType === 'Temperature' &&
 				typeof temperatureUnit !== 'undefined' &&
@@ -16046,7 +16132,7 @@ function RefreshHeaderBar () {
 			) {
 				tv = (parseFloat(e.value) * 1.8 + 32).toFixed(2) + '&deg;F';
 			}
-			tooltip += '<b>' + e.label + '</b>' + tv + '<br/>';
+			tooltip += '<b>' + EscapeHtml(e.label) + '</b>' + tv + '<br/>';
 		});
 		// The tooltip text changes on every refresh.  Bootstrap resolves a
 		// function title at show time, so stash the current text here and the
@@ -16060,11 +16146,11 @@ function RefreshHeaderBar () {
 		var sensorValues = [];
 		nonFanSensors.forEach(function (e) {
 			var icon = 'bolt';
-			var val = e.formatted;
+			var val = EscapeHtml(e.formatted);
 			if (e.valueType == 'Temperature') {
 				icon = 'thermometer-half';
 				if (typeof temperatureUnit !== 'undefined' && temperatureUnit) {
-					val = parseFloat(val * 1.8 + 32).toFixed(2);
+					val = parseFloat(e.formatted * 1.8 + 32).toFixed(2);
 					val += '&deg;F';
 				} else {
 					val += '&deg;C';
@@ -16072,7 +16158,7 @@ function RefreshHeaderBar () {
 			}
 			sensorIcons.push(icon);
 			sensorLabels.push(e.label);
-			sensorValues.push(e.label + val);
+			sensorValues.push(EscapeHtml(e.label) + val);
 		});
 
 		// Only the readings change from one refresh to the next, so rebuild the

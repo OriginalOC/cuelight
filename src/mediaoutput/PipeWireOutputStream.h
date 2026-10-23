@@ -90,6 +90,11 @@ public:
     // behind another must not go to PLAYING before then: its position runs
     // from PLAYING, so audio still queued ahead of it would leave the lights
     // ahead of the sound for the whole track.
+    //
+    // Then flush the stream, unless nothing was handed to it since the last
+    // flush: what that wait can't see -- audio held up by a stall in the
+    // graph -- would otherwise sit ahead of every track to come, and every
+    // track starts from the same empty queue (see Flush()).
     void WaitDrained(int maxMs);
 
     // Route `appsink`'s samples into this stream, replacing any previous
@@ -99,16 +104,32 @@ public:
     // stream forwards each buffer as soon as it arrives.
     void AttachFeed(GstElement* appsink);
 
-    // Time from a buffer entering this stream to it being handed to the
-    // graph -- what a position read at the feed has to be backed up by, on
-    // top of the card's own queue.
-    int64_t LatencyNs();
     // How far ahead of the clock a feed delivers (see AttachFeed()).
     static int64_t FeedLeadNs();
-    // The clock every pipeline feeding this stream must run on (a new
-    // reference).  It runs at the rate the card plays samples, not the
-    // system's: see DisciplineClock().
+    // The clock this stream's own pipeline runs on (a new reference).  It runs
+    // at the rate the card plays samples, not the system's: see
+    // DisciplineClock().
     GstClock* Clock();
+    // The clock every pipeline feeding this stream must run on (a new
+    // reference): the card clock, run faster or slower by SetFeedSpeed().
+    // Until a feed sets a speed it is the card clock exactly.
+    GstClock* FeedClock();
+    // Play `feed`'s media `speed` times as fast as the card plays samples (1.0
+    // is the card's own pace).  A MultiSync remote steers its copy of the
+    // show audio onto the master's timeline with this.  The feed clock runs
+    // `speed` times as fast, so the feed hands over media at that pace, and
+    // each buffer is resampled to the card's rate on the way in: the stream
+    // still gets exactly what the card plays, so nothing queues up or runs
+    // dry.  A GStreamer rate seek can't do it -- this stream plays at a fixed
+    // rate, so a faster feed only builds a queue the position can't see, and
+    // mp3 and FLAC refuse instant rate changes anyway (GstBaseParse).  No-op
+    // for a feed that isn't the current one; reset for each new feed.
+    void SetFeedSpeed(GstElement* feed, double speed);
+    // Drop what `feed` has handed over and not yet played, when it seeks:
+    // left in place, the sound from before the seek plays out first and
+    // everything after it is that much late, by an amount its position can't
+    // show.  No-op for a feed that isn't the current one.
+    void FlushFeed(GstElement* feed);
     // That rate, relative to the system clock, smoothed over the last couple
     // of minutes (1.000432 for a card 432 ppm fast).  1.0 until measured.
     double ClockRate() const { return m_clockRate.load(std::memory_order_relaxed); }
@@ -129,13 +150,23 @@ private:
     void CloseLocked(const char* why);
     void ForgetFailureLocked();
     void PushSilenceLocked(int ms);
+    bool WaitQueuedUntil(int64_t deadlineUs);
+    void Flush(bool prime);
     bool CardRunning();
     static int TailFlushMs();
     bool StreamLinked();
 
     static GstFlowReturn OnFeedSample(GstElement* appsink, gpointer userData);
-    void DisciplineClock();
+    // Whether the card lost time (an xrun) while a track was feeding the stream.
+    bool DisciplineClock();
     void ResetClockSyncLocked();
+    void EnsureClocksLocked();
+    // Re-derive the feed clock from the card clock and m_feedSpeed, continuous
+    // at `internal` (called whenever either changes).
+    void RecalibrateFeedClockLocked(GstClockTime internal);
+    // `in` resampled by m_feedSpeed (a new buffer), carrying m_rs* across calls.
+    GstBuffer* ResampleLocked(GstBuffer* in);
+    void KeepResampleHistoryLocked(GstBuffer* in);
 
     const int m_slot;
     std::mutex m_lock;
@@ -161,6 +192,8 @@ private:
     // have played, assuming the graph takes it at real time once queued.
     int64_t m_queuedUntilUs = 0;
     void NoteQueuedLocked(size_t bytes);
+    // Nothing has been handed to the stream since it was last flushed.
+    bool m_flushed = false;
     int m_rate = 0;                    // ...and their rate
     bool m_warnedCaps = false;         // logged a feed in the wrong format
     GstElement* m_feed = nullptr;      // appsink currently allowed to feed (no ref held)
@@ -168,6 +201,23 @@ private:
 
     // The card clock (DisciplineClock()).  Created on first use, never freed.
     GstClock* m_clock = nullptr;
+    // The feed clock (FeedClock()), and the speed it runs at against the card
+    // clock.  Both are under m_lock.
+    GstClock* m_feedClock = nullptr;
+    double m_feedSpeed = 1.0;
+    // The feed clock has run at a speed other than 1 since the feed attached,
+    // so it no longer reads what the card clock does.
+    bool m_feedDiverged = false;
+    // Resampling the feed (SetFeedSpeed()): on from the first speed other than
+    // 1 to the end of the feed.  m_rsPos is where the next output frame falls,
+    // in input frames from the start of the next buffer; m_rsHist the last
+    // fifteen input frames, the resampler's filter span less one (kept even
+    // while not resampling, so starting is seamless), oldest first,
+    // m_rsHistFrames of them valid.
+    bool m_rsActive = false;
+    double m_rsPos = 0.0;
+    float m_rsHist[15 * 2] = {};
+    int m_rsHistFrames = 0;
     std::atomic<double> m_clockRate{ 1.0 };
     std::string m_syncPath;            // the card the fields below describe
     int m_syncCardRate = 0;            // its nominal rate
@@ -175,7 +225,10 @@ private:
     int64_t m_syncHw0 = 0;             // hw_ptr at the anchor...
     GstClockTime m_syncInt0 = 0;       // ...the clock's internal time then...
     GstClockTime m_syncExt0 = 0;       // ...and its own time then
-    int64_t m_syncLastHw = 0;
+    int64_t m_syncLastHw = 0;          // hw_ptr as last read
+    int64_t m_syncWrap = 0;            // added to hw_ptr for each time it wrapped
+    std::string m_syncTrigger;         // the card's trigger_time as last read
+    uint64_t m_lastFlushMs = 0;        // NowMs() of the last Flush() (under m_lock)
     GstClockTime m_syncLastInt = 0;
     // (seconds of internal time, seconds of card time) since the anchor.
     std::deque<std::pair<double, double>> m_syncWindow;

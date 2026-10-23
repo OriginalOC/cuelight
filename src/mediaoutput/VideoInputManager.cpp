@@ -141,7 +141,19 @@ static YtDlpResult RunYtDlp(const std::string& format, const std::string& uri, b
         args.push_back("--print");
         args.push_back("fps");
     }
-    args.push_back(ShellSafeUri(uri));
+    // Only a web URL, and after "--" so it can never be read as an option:
+    // ShellSafeUri() keeps '-' and '=', and IsYouTubeUri() only looks for
+    // "youtube.com/" anywhere in it, so "--config-locations=.../youtube.com/x"
+    // had yt-dlp load an uploaded config, which can carry --exec.
+    std::string safeUri = ShellSafeUri(uri);
+    std::string scheme = safeUri.substr(0, 8);
+    std::transform(scheme.begin(), scheme.end(), scheme.begin(), ::tolower);
+    if (!startsWith(scheme, "http://") && !startsWith(scheme, "https://")) {
+        res.diagnostics = "not an http(s) URL";
+        return res;
+    }
+    args.push_back("--");
+    args.push_back(safeUri);
     std::vector<char*> argv;
     for (auto& a : args) {
         argv.push_back(a.data());
@@ -315,6 +327,14 @@ static void AddSourceWarning(const std::string& msg) {
     WarningHolder::AddWarning(56, msg);
 }
 
+static void RemoveSourceWarning(const std::string& msg) {
+    {
+        std::lock_guard<std::mutex> lock(s_sourceWarningsLock);
+        s_sourceWarnings.erase(msg);
+    }
+    WarningHolder::RemoveWarning(56, msg);
+}
+
 static void ClearSourceWarnings() {
     std::set<std::string> warnings;
     {
@@ -346,9 +366,9 @@ static bool GstValueUsable(const std::string& value, const char* what,
 #ifdef HAS_GSTREAMER_VIDEO_INPUT
 // Per-pipeline state behind the rtspsrc stream decisions below.
 //
-// Heap-allocated and owned by the signal closure -- freed by the
-// GClosureNotify when rtspsrc is finalised along with the pipeline -- rather
-// than living in the SourceInfo.  The pipeline outlives StartSource() and a
+// Heap-allocated and owned by the rtspsrc element as object data -- freed
+// when rtspsrc is finalised along with the pipeline -- rather than living in
+// the SourceInfo.  The pipeline outlives StartSource() and a
 // Reload can reallocate m_sources while it is still running, which is the
 // same hazard the run thread's copied-by-value locals guard against.
 struct RtspStreamFilter {
@@ -356,7 +376,24 @@ struct RtspStreamFilter {
     bool wantAudio = false;    // mirrors SourceInfo::audioEnabled
     bool videoSelected = false;
     bool audioSelected = false;
+    int offered = 0;           // SDP media select-stream has been asked about
 };
+
+static const char* RTSP_FILTER_KEY = "fpp-rtsp-stream-filter";
+
+static std::string NoVideoTrackWarning(const std::string& sourceName) {
+    return "Video input '" + sourceName + "': the RTSP stream contains no video track";
+}
+
+// The camera's SDP offered media, none of it video.  Retried on the backoff
+// like any failed source, since the camera's own configuration can add the
+// video track back; the warning comes down when a video media is selected
+// again (RtspSelectStream), or at the next reload.
+static void ReportNoVideoTrack(const RtspStreamFilter* filter) {
+    LogErr(VB_MEDIAOUT, "VideoInputManager: '%s' RTSP stream offers no video track\n",
+           filter->sourceName.c_str());
+    AddSourceWarning(NoVideoTrackWarning(filter->sourceName));
+}
 
 // rtspsrc's "select-stream" signal: return FALSE to keep it from ever
 // SETUPing a given SDP media.
@@ -389,6 +426,7 @@ static gboolean RtspSelectStream(GstElement*, guint idx, GstCaps* caps, gpointer
     // same benefit-of-the-doubt the original video-only filter gave it.
     const bool isVideo = !media || g_strcmp0(media, "video") == 0;
     const bool isAudio = media && g_strcmp0(media, "audio") == 0;
+    filter->offered++;
 
     if (isVideo) {
         if (filter->videoSelected) {
@@ -398,6 +436,7 @@ static gboolean RtspSelectStream(GstElement*, guint idx, GstCaps* caps, gpointer
             return FALSE;
         }
         filter->videoSelected = true;
+        RemoveSourceWarning(NoVideoTrackWarning(filter->sourceName));
         return TRUE;
     }
 
@@ -420,10 +459,27 @@ static void RtspNoMorePads(GstElement*, gpointer userData) {
     if (!filter || filter->videoSelected) {
         return;
     }
-    LogErr(VB_MEDIAOUT, "VideoInputManager: '%s' RTSP stream offers no video track\n",
-           filter->sourceName.c_str());
-    AddSourceWarning("Video input '" + filter->sourceName +
-                                      "': the RTSP stream contains no video track");
+    ReportNoVideoTrack(filter);
+}
+
+// When select-stream refused every media -- an audio-only camera on a source
+// with audio off -- rtspsrc creates no pads, so "no-more-pads" never fires:
+// it fails instead with "No supported stream was found", which reads as a
+// transport problem.  Called for a pipeline error; reports the real cause and
+// returns true if that is what happened.
+static bool RtspFailedForNoVideo(GstElement* pipeline) {
+    GstElement* rtspEl = gst_bin_get_by_name(GST_BIN(pipeline), "rtspvsrc");
+    if (!rtspEl) {
+        return false;
+    }
+    // Written on rtspsrc's thread before it posted the error this is called for.
+    auto* filter = static_cast<RtspStreamFilter*>(g_object_get_data(G_OBJECT(rtspEl), RTSP_FILTER_KEY));
+    bool noVideo = filter && filter->offered > 0 && !filter->videoSelected;
+    if (noVideo) {
+        ReportNoVideoTrack(filter);
+    }
+    gst_object_unref(rtspEl);
+    return noVideo;
 }
 
 // Route each rtspsrc pad to the branch matching its media type.
@@ -761,8 +817,8 @@ void VideoInputManager::RestartSource(int sourceId) {
     bool started = StartSource(*source);
     s_ytPrefetched.clear();
     if (!started) {
-        // It started before, so the config is good: this is a lookup or a
-        // resource that isn't back yet (a YouTube URL that won't resolve).
+        // A lookup or a resource that isn't back yet (a YouTube URL that
+        // won't resolve): keep trying, on the backoff.
         ScheduleSourceRestart(sourceId);
     }
 }
@@ -811,8 +867,11 @@ void VideoInputManager::StartLoadedSources(std::unique_lock<std::mutex>& lock) {
         }
     }
     for (auto& source : m_sources) {
-        if (source.enabled) {
-            StartSource(source);
+        // A source that can't start yet (yt-dlp with no network at boot, a
+        // camera still coming up) is retried on the backoff, like one whose
+        // pipeline dies later; nothing else would try it again before Apply.
+        if (source.enabled && !StartSource(source)) {
+            ScheduleSourceRestart(source.id);
         }
     }
     s_ytPrefetched.clear();
@@ -969,55 +1028,68 @@ bool VideoInputManager::LoadConfig() {
 
     for (const auto& entry : root) {
         SourceInfo si;
-        si.id = entry.get("id", 0).asInt();
-        si.name = entry.get("name", "").asString();
-        si.type = entry.get("type", "").asString();
-        si.pipeWireNodeName = entry.get("pipeWireNodeName", "").asString();
-        si.enabled = entry.get("enabled", true).asBool();
+        // asInt()/asBool()/asString() throw on a value of the wrong type, and
+        // this runs on the reload worker thread, where an escaping exception
+        // terminates fppd (at every start, since Init() asks for a reload);
+        // skip that source.
+        try {
+            if (!entry.isObject()) {
+                continue;
+            }
+            si.id = entry.get("id", 0).asInt();
+            si.name = entry.get("name", "").asString();
+            si.type = entry.get("type", "").asString();
+            si.pipeWireNodeName = entry.get("pipeWireNodeName", "").asString();
+            si.enabled = entry.get("enabled", true).asBool();
 
-        si.width = entry.get("width", 320).asInt();
-        si.height = entry.get("height", 240).asInt();
-        si.framerate = entry.get("framerate", 10).asInt();
+            si.width = entry.get("width", 320).asInt();
+            si.height = entry.get("height", 240).asInt();
+            si.framerate = entry.get("framerate", 10).asInt();
 
-        if (si.type == "videotestsrc") {
-            si.pattern = entry.get("pattern", "smpte").asString();
-        } else if (si.type == "v4l2src") {
-            si.device = entry.get("device", "/dev/video0").asString();
-            si.powerLineFrequency = entry.get("powerLineFrequency", -1).asInt();
-            si.exposureMode = entry.get("exposureMode", "camera").asString();
-            si.exposureTime100us = entry.get("exposureTime100us", -1).asInt();
-            si.dynamicFramerate = entry.get("dynamicFramerate", -1).asInt();
-            if (si.powerLineFrequency < 0 || si.powerLineFrequency > 2)
-                si.powerLineFrequency = -1;
-            if (si.exposureMode != "auto" && si.exposureMode != "manual")
-                si.exposureMode = "camera";
-            if (si.dynamicFramerate < 0 || si.dynamicFramerate > 1)
-                si.dynamicFramerate = -1;
-            // 100us units: 1 .. 1s.  The device's own range is applied on
-            // top of this in V4L2Device::ApplyControls.
-            if (si.exposureTime100us < 1 || si.exposureTime100us > 10000)
-                si.exposureTime100us = -1;
-        } else if (si.type == "rtspsrc") {
-            si.uri = entry.get("uri", "").asString();
-            si.latency = entry.get("latency", 200).asInt();
-            if (si.latency < 0) si.latency = 0;
-            if (si.latency > 10000) si.latency = 10000;
-        } else if (si.type == "urisrc") {
-            si.uri = entry.get("uri", "").asString();
-            si.bufferSec = entry.get("bufferSec", 3.0).asDouble();
-            if (si.bufferSec < 0) si.bufferSec = 0;
-            if (si.bufferSec > 30) si.bufferSec = 30;
-        } else if (si.type == "rtpsrc") {
-            si.port = entry.get("port", 5004).asInt();
-            si.encoding = entry.get("encoding", "H264").asString();
-            si.multicastGroup = entry.get("multicastGroup", "").asString();
-            if (si.port < 1024) si.port = 1024;
-            if (si.port > 65535) si.port = 65535;
+            if (si.type == "videotestsrc") {
+                si.pattern = entry.get("pattern", "smpte").asString();
+            } else if (si.type == "v4l2src") {
+                si.device = entry.get("device", "/dev/video0").asString();
+                si.powerLineFrequency = entry.get("powerLineFrequency", -1).asInt();
+                si.exposureMode = entry.get("exposureMode", "camera").asString();
+                si.exposureTime100us = entry.get("exposureTime100us", -1).asInt();
+                si.dynamicFramerate = entry.get("dynamicFramerate", -1).asInt();
+                if (si.powerLineFrequency < 0 || si.powerLineFrequency > 2)
+                    si.powerLineFrequency = -1;
+                if (si.exposureMode != "auto" && si.exposureMode != "manual")
+                    si.exposureMode = "camera";
+                if (si.dynamicFramerate < 0 || si.dynamicFramerate > 1)
+                    si.dynamicFramerate = -1;
+                // 100us units: 1 .. 1s.  The device's own range is applied on
+                // top of this in V4L2Device::ApplyControls.
+                if (si.exposureTime100us < 1 || si.exposureTime100us > 10000)
+                    si.exposureTime100us = -1;
+            } else if (si.type == "rtspsrc") {
+                si.uri = entry.get("uri", "").asString();
+                si.latency = entry.get("latency", 200).asInt();
+                if (si.latency < 0) si.latency = 0;
+                if (si.latency > 10000) si.latency = 10000;
+            } else if (si.type == "urisrc") {
+                si.uri = entry.get("uri", "").asString();
+                si.bufferSec = entry.get("bufferSec", 3.0).asDouble();
+                if (si.bufferSec < 0) si.bufferSec = 0;
+                if (si.bufferSec > 30) si.bufferSec = 30;
+            } else if (si.type == "rtpsrc") {
+                si.port = entry.get("port", 5004).asInt();
+                si.encoding = entry.get("encoding", "H264").asString();
+                si.multicastGroup = entry.get("multicastGroup", "").asString();
+                if (si.port < 1024) si.port = 1024;
+                if (si.port > 65535) si.port = 65535;
+            }
+
+            // Audio extraction settings
+            si.audioEnabled = entry.get("audioEnabled", false).asBool();
+            si.audioPipeWireNodeName = entry.get("audioPipeWireNodeName", "").asString();
+        } catch (const std::exception& ex) {
+            LogWarn(VB_MEDIAOUT, "VideoInputManager: skipping a source in %s, a value has the wrong type: %s\n",
+                    configPath.c_str(), ex.what());
+            continue;
         }
-
-        // Audio extraction settings
-        si.audioEnabled = entry.get("audioEnabled", false).asBool();
-        si.audioPipeWireNodeName = entry.get("audioPipeWireNodeName", "").asString();
 
         if (si.type.empty() || si.pipeWireNodeName.empty()) {
             LogWarn(VB_MEDIAOUT, "VideoInputManager: Skipping source with missing type or node name\n");
@@ -1377,21 +1449,19 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
     if (source.type == "rtspsrc") {
         GstElement* rtspEl = gst_bin_get_by_name(GST_BIN(source.pipeline), "rtspvsrc");
         if (rtspEl) {
-            // Owned by the closure: the last handler to be disconnected frees
-            // it, which happens when rtspsrc is finalised with the pipeline.
-            // All three handlers run on rtspsrc's own thread, one media at a
-            // time, so the shared state needs no locking.
+            // Owned by the element: freed when rtspsrc is finalised with the
+            // pipeline, so it outlives every handler below and the run
+            // thread's error check (RtspFailedForNoVideo).  The three handlers
+            // run on rtspsrc's own thread, one media at a time, so the shared
+            // state needs no locking.
             auto* filter = new RtspStreamFilter{ source.name, useRtspAudio, false, false };
+            g_object_set_data_full(G_OBJECT(rtspEl), RTSP_FILTER_KEY, filter,
+                                   [](gpointer d) { delete static_cast<RtspStreamFilter*>(d); });
             g_signal_connect(rtspEl, "select-stream", G_CALLBACK(RtspSelectStream), filter);
             if (useRtspAudio) {
                 g_signal_connect(rtspEl, "pad-added", G_CALLBACK(RtspLinkPadToBranch), filter);
             }
-            // "no-more-pads" is connected either way and carries the destroy
-            // notify that frees the shared state, so it outlives the handlers
-            // above and is released once with the element.
-            g_signal_connect_data(rtspEl, "no-more-pads", G_CALLBACK(RtspNoMorePads), filter,
-                                  [](gpointer d, GClosure*) { delete static_cast<RtspStreamFilter*>(d); },
-                                  GConnectFlags(0));
+            g_signal_connect(rtspEl, "no-more-pads", G_CALLBACK(RtspNoMorePads), filter);
             gst_object_unref(rtspEl);
         }
     }
@@ -1499,7 +1569,7 @@ bool VideoInputManager::StartSource(SourceInfo& source) {
                     GError* err = nullptr;
                     gchar* debug = nullptr;
                     gst_message_parse_error(msg, &err, &debug);
-                    if (!shutdownFlag->load()) {
+                    if (!shutdownFlag->load() && !RtspFailedForNoVideo(pipeline)) {
                         LogWarn(VB_MEDIAOUT, "VideoInputManager: Source '%s' error: %s (%s)\n",
                                 sourceName.c_str(), err ? err->message : "?", debug ? debug : "");
                     }

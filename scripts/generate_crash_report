@@ -167,6 +167,26 @@ CRASH_JSON_KEY="(\"([A-Za-z0-9_.-]*((${CRASH_BACKSTOP_LOOSE})[A-Za-z0-9_.-]*|(${
 CRASH_KEY_RE="[A-Za-z0-9_.-]*((${CRASH_BACKSTOP_LOOSE})[A-Za-z0-9_.-]*|(${CRASH_BACKSTOP_TIGHT}))|${CRASH_SECRET_KEYS}"
 CRASH_ENABLE_LINE='^[[:space:]]*"?[A-Za-z0-9_.-]*[Ee]nable"?[[:space:]]*[:=]'
 
+# The cape's serial number ships only where the user lets it be shared
+# (SendVendorSerial, on unless turned off). Withholding cape-eeprom.bin is not
+# enough: fppcapedetect prints the serial at every boot, and that line reaches
+# fppd.log, the journal and the crash log ring. So with sharing off, the
+# redactor takes the serial out of every file: the capedetect line by its
+# shape, and the serial itself, read from the cape info, wherever else it is.
+CRASH_SERIAL_RULES=()
+CRASH_SERIAL_SHARING_OFF=0
+if grep -qE '^[[:space:]]*SendVendorSerial[[:space:]]*=[[:space:]]*"?0"?[[:space:]]*$' settings 2>/dev/null; then
+    CRASH_SERIAL_SHARING_OFF=1
+    CRASH_SERIAL_RULES=(-e 's/(Serial Number:[[:space:]]*)[^[:space:]]+/\1**REDACTED**/g')
+    crash_cape_serial=$(sed -nE 's/.*"serialNumber"[[:space:]]*:[[:space:]]*"([^"\\]*)".*/\1/p' tmp/cape-info.json 2>/dev/null | head -n 1)
+    # Too short a serial would match ordinary text too; the shape rule above
+    # still covers the capedetect line.
+    if [ "${#crash_cape_serial}" -ge 4 ]; then
+        crash_cape_serial=$(printf '%s' "$crash_cape_serial" | sed -e 's/[]\/$*.^[|(){}+?]/\\&/g')
+        CRASH_SERIAL_RULES+=(-e "s/(^|[^A-Za-z0-9])${crash_cape_serial}([^A-Za-z0-9]|\$)/\1**REDACTED**\2/g")
+    fi
+fi
+
 # Redact stdin to stdout. Used for every file that leaves the device, so there
 # is exactly one copy of this policy rather than the six divergent ones this
 # replaced.  LC_ALL=C: ~12x faster than UTF-8, and a value with invalid UTF-8 is
@@ -231,7 +251,8 @@ redact_stream() {
         -e 's/(^|[^A-Za-z0-9])(AKIA|ASIA)[A-Z0-9]{16}([^A-Za-z0-9]|$)/\1**REDACTED**\3/g' \
         -e 's/(^|[^A-Za-z0-9_-])(sk-[A-Za-z0-9_-]{20,}|[sr]k_(live|test)_[A-Za-z0-9]{16,}|xox[abprs]-[A-Za-z0-9-]{10,}|AIza[0-9A-Za-z_-]{35})/\1**REDACTED**/g' \
         `# 7. Tidy "key => v" that rule 2 re-matched as "key =**REDACTED** **REDACTED**"` \
-        -e 's/([^[:space:]=])([[:space:]]*)=\*\*REDACTED\*\* \*\*REDACTED\*\*/\1\2=> **REDACTED**/g'
+        -e 's/([^[:space:]=])([[:space:]]*)=\*\*REDACTED\*\* \*\*REDACTED\*\*/\1\2=> **REDACTED**/g' \
+        "${CRASH_SERIAL_RULES[@]}"
 }
 
 # Interface config fields that may leave the device. Declared in
@@ -321,6 +342,17 @@ crash_report_json_escape() {
     printf '%s' "$1" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g' | tr -d '\000-\037'
 }
 
+# The commit says which source a plugin was built from, not what binary it is
+# running. A prebuilt plugin (FPPMon) downloads its .so from a release, and a
+# plugin that builds on the device can be left with a stale or failed build,
+# so record the sha256 of each .so it ships as well. Matchable against a
+# release's published hashes, closed-source plugins included.
+if command -v sha256sum >/dev/null 2>&1; then
+    CRASH_SHA256=(sha256sum)
+else
+    CRASH_SHA256=(shasum -a 256)
+fi
+
 {
     printf '{\n  "plugins": [\n'
     sep=""
@@ -330,6 +362,17 @@ crash_report_json_escape() {
         printf '%s' "$sep"
         sep=$',\n'
         printf '    {"name": "%s"' "$(crash_report_json_escape "$plugin_name")"
+
+        lib_sep=""
+        for plugin_lib in "$plugin_dir"*.so; do
+            [ -f "$plugin_lib" ] || continue
+            lib_hash=$("${CRASH_SHA256[@]}" "$plugin_lib" 2>/dev/null | cut -d' ' -f1)
+            [ -n "$lib_hash" ] || continue
+            [ -z "$lib_sep" ] && printf ', "libs": {'
+            printf '%s"%s": "%s"' "$lib_sep" "$(crash_report_json_escape "$(basename "$plugin_lib")")" "$lib_hash"
+            lib_sep=", "
+        done
+        [ -n "$lib_sep" ] && printf '}'
 
         if [ ! -e "$plugin_dir/.git" ]; then
             printf ', "error": "not a git checkout"}'
@@ -386,6 +429,18 @@ fi
 # and FPP's logs carry host names, LAN addresses and discovered-device
 # identifiers. It ships further down, at the same level as logs/fppd.log.
 cp "$CRASH_TMP"/fppd_crash_context.log "$TEMP_DIR/" 2>/dev/null || true
+
+# Whether the files in that map are what their packages shipped, and whether
+# the code fppd ran at the fault is what the file on disk holds -- see the
+# header of crash_module_integrity.py. A damaged or replaced library otherwise
+# reads as a code bug. Hashes and the same library paths as the map, so every
+# level. Never allowed to fail the report.
+if [ -f "$CRASH_TMP"/fppd_crash_context.log ] && [ -x "$FPPDIR"/scripts/crash_module_integrity.py ]; then
+    TIMEOUT=$(command -v timeout)
+    ${TIMEOUT:+$TIMEOUT -k 5 90} "$FPPDIR"/scripts/crash_module_integrity.py \
+        "$CRASH_TMP"/fppd_crash_context.log "$TEMP_DIR/module_integrity.json" >/dev/null 2>&1 || true
+    [ -s "$TEMP_DIR/module_integrity.json" ] || rm -f "$TEMP_DIR/module_integrity.json"
+fi
 
 # Contact address, if the user gave one.
 #
@@ -500,8 +555,10 @@ with open(sys.argv[2], "w") as f:
         
         # Boot logs
         mkdir -p "$TEMP_DIR/tmp"
-        dmesg -T > "$TEMP_DIR/tmp/boot.log" 2>/dev/null || true
-        journalctl -b -u fppinit -u fppoled -u fpp_postnetwork >> "$TEMP_DIR/tmp/boot.log" 2>/dev/null || true
+        # Through the redactor like every other file: fppinit's journal holds
+        # the same output its fppd.log copy has redacted.
+        { dmesg -T; journalctl -b -u fppinit -u fppoled -u fpp_postnetwork; } 2>/dev/null \
+            | redact_stream > "$TEMP_DIR/tmp/boot.log" 2>/dev/null
         
         # Config directory (scrub sensitive files)
         if [ -d "config" ]; then
@@ -537,7 +594,7 @@ with open(sys.argv[2], "w") as f:
                             # the cape's serial number, so it ships only where
                             # the user lets that be shared (SendVendorSerial,
                             # on unless turned off).
-                            if grep -qE '^[[:space:]]*SendVendorSerial[[:space:]]*=[[:space:]]*"?0"?[[:space:]]*$' settings 2>/dev/null; then
+                            if [ "$CRASH_SERIAL_SHARING_OFF" -eq 1 ]; then
                                 echo "**OMITTED: cape EEPROM (serial number sharing is off)**" > "$TEMP_DIR/config/$filename"
                             else
                                 redact_copy "$file" "$TEMP_DIR/config/$filename"
@@ -577,6 +634,19 @@ with open(sys.argv[2], "w") as f:
             redact_copy "logs/apache2-error.log" "$TEMP_DIR/logs/apache2-error.log"
         fi
 
+        # Plugin install/update and FPP upgrade output: the end of each log.
+        # fppd.log records only that an upgrade or a plugin build failed and
+        # with what rc; why is only in these.  A crash right after an upgrade
+        # is common enough that crash reports need them, not just manual ones.
+        for log in fpp_plugin_manager.log fpp_system_upgrades.log; do
+            [ -f "logs/$log" ] || continue
+            if [ "$(wc -c < "logs/$log")" -gt 1048576 ]; then
+                tail -c 1048576 "logs/$log" | tail -n +2 | redact_stream > "$TEMP_DIR/logs/$log"
+            else
+                redact_copy "logs/$log" "$TEMP_DIR/logs/$log"
+            fi
+        done
+
         # Manual reports only.  The timeouts stop a hung command from pushing
         # the whole build past fppd's 240s limit (which keeps it inside PHP's
         # 270s); a build that hits it writes no report at all.
@@ -595,16 +665,8 @@ with open(sys.argv[2], "w") as f:
                 echo "** truncated: timed out after 30s **" >> "$TEMP_DIR/logs/healthCheck.log" ;;
             esac
 
-            # Plugin install/update and FPP upgrade failures: the end of their
-            # logs, the plugin update state and what git says about /opt/fpp
-            for log in fpp_plugin_manager.log fpp_system_upgrades.log; do
-                [ -f "logs/$log" ] || continue
-                if [ "$(wc -c < "logs/$log")" -gt 1048576 ]; then
-                    tail -c 1048576 "logs/$log" | tail -n +2 | redact_stream > "$TEMP_DIR/logs/$log"
-                else
-                    redact_copy "logs/$log" "$TEMP_DIR/logs/$log"
-                fi
-            done
+            # The plugin update state and what git says about /opt/fpp (the
+            # upgrade and plugin logs themselves went in with the other logs)
             [ -f cache/plugin_updates.json ] && redact_copy cache/plugin_updates.json "$TEMP_DIR/logs/plugin_updates.json"
             { git -C "$FPPDIR" status -sb; git -C "$FPPDIR" diff --stat; } 2>&1 | redact_stream > "$TEMP_DIR/logs/git_status.txt"
         fi
