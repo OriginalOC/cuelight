@@ -143,23 +143,40 @@ static int RecordWedgeRestartAndCount() {
     return (int)stamps.size();
 }
 
+// Set on a decodebin that chose a hardware video decoder (OnAutoplugSelect).
+static constexpr const char* HW_DECODER_CHOSEN_KEY = "fpp-hw-decoder-chosen";
+
 // Whether `pipeline` holds a hardware video decoder (element class
-// "Codec/Decoder/Video/Hardware" -- the V4L2 stateful and stateless decoders).
+// "Codec/Decoder/Video/Hardware" -- the V4L2 stateful and stateless decoders),
+// or its decodebin chose one that never got made.  decodebin chooses from the
+// registry, and making the element loads its plugin, whose init opens every
+// V4L2 device to register the decoders.  A decoder driver that has died (a
+// bcm2835-codec oops leaves its mutex held) blocks that open() for good, and
+// every later load waits behind it, so no decoder shows up in the pipeline.
+// A pipeline that chose one and holds no video decoder at all is stuck there;
+// one that fell back to a software decoder is not.
 static bool PipelineHasHwVideoDecoder(GstElement* pipeline) {
     if (!pipeline || !GST_IS_BIN(pipeline)) {
         return false;
     }
     bool found = false;
+    bool chosen = false;
+    bool videoDecoder = false;
     GstIterator* it = gst_bin_iterate_recurse(GST_BIN(pipeline));
     GValue item = G_VALUE_INIT;
     bool done = false;
     while (!done && !found) {
         switch (gst_iterator_next(it, &item)) {
         case GST_ITERATOR_OK: {
-            GstElementFactory* f = gst_element_get_factory(GST_ELEMENT(g_value_get_object(&item)));
+            GstElement* element = GST_ELEMENT(g_value_get_object(&item));
+            GstElementFactory* f = gst_element_get_factory(element);
             const gchar* klass = f ? gst_element_factory_get_metadata(f, GST_ELEMENT_METADATA_KLASS) : nullptr;
-            if (klass && strstr(klass, "Decoder") && strstr(klass, "Video") && strstr(klass, "Hardware")) {
-                found = true;
+            if (klass && strstr(klass, "Decoder") && strstr(klass, "Video")) {
+                videoDecoder = true;
+                found = strstr(klass, "Hardware") != nullptr;
+            }
+            if (g_object_get_data(G_OBJECT(element), HW_DECODER_CHOSEN_KEY)) {
+                chosen = true;
             }
             g_value_reset(&item);
             break;
@@ -174,7 +191,7 @@ static bool PipelineHasHwVideoDecoder(GstElement* pipeline) {
     }
     g_value_unset(&item);
     gst_iterator_free(it);
-    return found;
+    return found || (chosen && !videoDecoder);
 }
 
 // The restart and reboot rungs below exist for one failure: a hardware video
@@ -504,8 +521,27 @@ static void GuardVideoConvert(GstElement* element) {
     }
 }
 
+// decodebin's "autoplug-select", asked before it makes each element: note a
+// hardware video decoder on the decodebin (see PipelineHasHwVideoDecoder) and
+// let it go ahead.  0 is GST_AUTOPLUG_SELECT_TRY, whose enum is not public.
+static gint OnAutoplugSelect(GstElement* decodebin, GstPad*, GstCaps*, GstElementFactory* factory, gpointer) {
+    const gchar* klass = gst_element_factory_get_metadata(factory, GST_ELEMENT_METADATA_KLASS);
+    if (klass && strstr(klass, "Decoder") && strstr(klass, "Video") && strstr(klass, "Hardware")) {
+        g_object_set_data(G_OBJECT(decodebin), HW_DECODER_CHOSEN_KEY, GINT_TO_POINTER(1));
+    }
+    return 0;
+}
+
+static void WatchDecoderChoice(GstElement* element) {
+    GstElementFactory* factory = gst_element_get_factory(element);
+    if (factory && strcmp(gst_plugin_feature_get_name(GST_PLUGIN_FEATURE(factory)), "decodebin") == 0) {
+        g_signal_connect(element, "autoplug-select", G_CALLBACK(OnAutoplugSelect), nullptr);
+    }
+}
+
 static void OnDeepElementAdded(GstBin*, GstBin*, GstElement* element, gpointer) {
     GuardVideoConvert(element);
+    WatchDecoderChoice(element);
 }
 
 void GStreamerOutput::GuardVideoConvertInputs(GstElement* pipeline) {
@@ -523,6 +559,7 @@ void GStreamerOutput::GuardVideoConvertInputs(GstElement* pipeline) {
         switch (gst_iterator_next(it, &item)) {
         case GST_ITERATOR_OK:
             GuardVideoConvert(GST_ELEMENT(g_value_get_object(&item)));
+            WatchDecoderChoice(GST_ELEMENT(g_value_get_object(&item)));
             g_value_reset(&item);
             break;
         case GST_ITERATOR_RESYNC:
@@ -1105,6 +1142,18 @@ int GStreamerOutput::Start(int msTime) {
     LogDebug(VB_MEDIAOUT, "GStreamer: Start(%d) enter - %s\n", msTime, m_mediaFilename.c_str());
     std::lock_guard<std::recursive_mutex> opLock(m_opMutex);
 
+    // Off the slot table until SetActiveOutput() at the end, as in Close():
+    // an output started again below is still registered from its last run,
+    // and the slot manager's calls into it (SetVolume() from Set Slot Volume
+    // on an HTTP thread) would meet the guard, m_volume and the pipeline
+    // being rebuilt here without the guard lock.  Waits out any such call in
+    // progress.  m_opMutex before the slot manager's lock, as documented on
+    // m_opMutex.  The manager's pump try-locks m_opMutex under its own lock,
+    // but a Process() it runs can go on to Stop() (and so into the slot
+    // manager again) on the same thread; no path does that while another
+    // thread sits here, but it is the exception to the order.
+    StreamSlotManager::Instance().DetachOutput(m_streamSlot, this);
+
     // An output can be started again once its media has ended (a remote that
     // missed the stop and open packets is handed the same file again).  That
     // run's pipeline, bus, guard and slot registration are all still here and
@@ -1138,8 +1187,9 @@ int GStreamerOutput::Start(int msTime) {
     // Fresh lifetime guard for this pipeline's decodebin pad callbacks.  Any
     // connection left over from a previous pipeline holds the previous guard,
     // which Close() already cleared, so it can never reach this object again.
-    m_cbGuard = std::make_shared<CallbackGuard>();
-    m_cbGuard->self = this;
+    auto cbGuard = std::make_shared<CallbackGuard>();
+    cbGuard->self = this;
+    m_cbGuard.store(cbGuard);
 
     // Reset MultiSync rate-matching state for the new track
     m_currentRate = 1.0f;
@@ -2325,7 +2375,7 @@ int GStreamerOutput::Start(int msTime) {
     // It runs on streaming threads, so it gets the lifetime guard rather than
     // `this`; the bus drops that reference once no call is in flight.
     gst_bus_set_sync_handler(m_bus, BusSyncHandler,
-                             new std::shared_ptr<CallbackGuard>(m_cbGuard),
+                             new std::shared_ptr<CallbackGuard>(m_cbGuard.load()),
                              ReleaseBusCallbackGuard);
 
     // Force the pipeline to use GstSystemClock instead of auto-selecting
@@ -2936,14 +2986,13 @@ void GStreamerOutput::DetachCallbacks() {
     // and makes every later one a no-op.  The bus sync handler doesn't hold
     // the lock while it runs, so wait for it separately.  Never call this from
     // a streaming thread: it waits for the handlers running on them.
-    if (m_cbGuard) {
+    if (auto guard = m_cbGuard.load()) {
         {
-            std::unique_lock<std::recursive_mutex> lock(m_cbGuard->mtx);
-            m_cbGuard->self = nullptr;
-            auto guard = m_cbGuard;
+            std::unique_lock<std::recursive_mutex> lock(guard->mtx);
+            guard->self = nullptr;
             guard->busIdle.wait(lock, [&guard] { return guard->busInFlight == 0; });
         }
-        m_cbGuard.reset();
+        m_cbGuard.store(nullptr);
     }
 }
 
@@ -2974,7 +3023,7 @@ void GStreamerOutput::AlignPictureToSound(int64_t latNs) {
     std::vector<GstElement*> sinks;
     {
         // OnNoMorePads() can remove the kmssink on a streaming thread.
-        std::shared_ptr<CallbackGuard> guard = m_cbGuard;
+        std::shared_ptr<CallbackGuard> guard = m_cbGuard.load();
         std::unique_lock<std::recursive_mutex> lock;
         if (guard) {
             lock = std::unique_lock<std::recursive_mutex>(guard->mtx);
@@ -3479,7 +3528,7 @@ int GStreamerOutput::Process(void) {
             // OnNoMorePads() removes the kmssink of a file that turned out to
             // have no video, on a streaming thread, under the callback guard;
             // the bin's was the only reference, so take our own under it.
-            std::shared_ptr<CallbackGuard> guard = m_cbGuard;
+            std::shared_ptr<CallbackGuard> guard = m_cbGuard.load();
             std::unique_lock<std::recursive_mutex> lock;
             if (guard) {
                 lock = std::unique_lock<std::recursive_mutex>(guard->mtx);
@@ -4469,6 +4518,12 @@ int GStreamerOutput::AdjustSpeed(float masterMediaPosition) {
 // in a few seconds -- a remote starting late, a missed sync -- is one
 // accurate seek to where the master will be once the seek is heard, aimed
 // using what earlier seeks took.
+//
+// Every decision is made on the lowest reading of the last two seconds, not
+// the latest (FeedSyncWindow): a late sync packet can only make this remote
+// look ahead, so one alone never seeks, never moves the servo, and never
+// teaches the next seek its aim.  An error the window agrees on is acted on
+// as before -- behind at once, ahead once two seconds of packets say so.
 int GStreamerOutput::AdjustFeedSpeed(float masterMediaPosition) {
     constexpr double kResyncS = 0.050;        // beyond this, seek rather than slew
     constexpr double kMaxSpeedOffset = 0.005; // +-0.5%
@@ -4486,12 +4541,16 @@ int GStreamerOutput::AdjustFeedSpeed(float masterMediaPosition) {
     if (gst_element_query_position(m_pwFeed, GST_FORMAT_TIME, &pos) && pos >= 0) {
         local = std::max(0.0, (double)(pos - AudioSinkLatencyNs()) / GST_SECOND - mediaOffset);
     }
-    double err = local - masterMediaPosition;  // > 0: this remote is ahead
+    double raw = local - masterMediaPosition;  // > 0: this remote is ahead
 
     if (m_feedResyncMs && now - m_feedResyncMs < kResyncSettleMs) {
         return 1;  // still landing
     }
-    if (m_feedResyncLanding) {
+    // The lowest of the last two seconds (FeedSyncWindow).  Until a second
+    // reading agrees, nothing is seeked or learnt on it.
+    double err = m_feedErrWindow.Add(now, raw, masterMediaPosition);
+    bool agreed = m_feedErrWindow.Agreed();
+    if (m_feedResyncLanding && agreed) {
         // How far the last seek landed off is how much more (or less) lead
         // the next one needs.
         m_feedResyncLanding = false;
@@ -4501,7 +4560,7 @@ int GStreamerOutput::AdjustFeedSpeed(float masterMediaPosition) {
         LogDebug(VB_MEDIAOUT, "GStreamer feed sync: resync landed %+.1f ms from the master; seeks now aim %.0f ms ahead\n",
                  err * 1000.0, s_feedResyncLeadS * 1000.0);
     }
-    if (std::fabs(err) > kResyncS) {
+    if (agreed && std::fabs(err) > kResyncS) {
         double target = masterMediaPosition + s_feedResyncLeadS;
         LogInfo(VB_MEDIAOUT, "GStreamer feed sync: %+.0f ms from the master (%.3f vs %.3f), seeking to %.3f\n",
                 err * 1000.0, local, masterMediaPosition, target);
@@ -4510,6 +4569,7 @@ int GStreamerOutput::AdjustFeedSpeed(float masterMediaPosition) {
         m_feedSpeedLastMs = 0;
         m_feedResyncMs = now;
         m_feedResyncLanding = true;
+        m_feedErrWindow.Clear();  // the seek starts a new timeline
         gst_element_seek(m_pipeline, 1.0, GST_FORMAT_TIME,
                          (GstSeekFlags)(GST_SEEK_FLAG_FLUSH | GST_SEEK_FLAG_ACCURATE),
                          GST_SEEK_TYPE_SET, (gint64)(target * GST_SECOND), GST_SEEK_TYPE_NONE, 0);
@@ -4522,8 +4582,10 @@ int GStreamerOutput::AdjustFeedSpeed(float masterMediaPosition) {
     m_feedSpeedErrInt = std::clamp(m_feedSpeedErrInt + err * dt, -kMaxSpeedOffset / kKi, kMaxSpeedOffset / kKi);
     double speed = 1.0 - std::clamp(kKp * err + kKi * m_feedSpeedErrInt, -kMaxSpeedOffset, kMaxSpeedOffset);
     m_pwStream->SetFeedSpeed(m_pwFeed, speed);
-    LogDebug(VB_MEDIAOUT, "GStreamer feed sync: master %.3f local %.3f error %+.1f ms, speed %+.0f ppm\n",
-             masterMediaPosition, local, err * 1000.0, (speed - 1.0) * 1e6);
+    // `error` is what the servo steered by; `this packet` its own reading,
+    // larger when it arrived late.
+    LogDebug(VB_MEDIAOUT, "GStreamer feed sync: master %.3f local %.3f error %+.1f ms, speed %+.0f ppm (this packet %+.1f ms)\n",
+             masterMediaPosition, local, err * 1000.0, (speed - 1.0) * 1e6, raw * 1000.0);
     return 1;
 }
 
@@ -4601,23 +4663,44 @@ void GStreamerOutput::ApplyRate(float rate) {
 // is restored while the pipeline is still prerolling, which is exactly when
 // no-more-pads fires).  Taken under the same guard, the reference keeps the
 // element alive for the caller's g_object_set().
+//
+// Stop() races this too: an output stays on its slot until Close(), so Set
+// Slot Volume reaches one that Play Media is replacing or Stop Media Slot is
+// stopping on another HTTP thread.  DetachCallbacks() clears `self` under the
+// guard lock before Stop() hands m_volume to the teardown thread and before
+// Close() unrefs it, so with `self` gone m_volume is not ours to read, and the
+// guard pointer itself is read atomically because DetachCallbacks() drops it.
+// `self` being set says only that no teardown has begun: Start() builds the
+// pipeline, m_volume included, without the guard lock, and is kept safe by
+// taking the output off its slot first, not by anything here.
+// Not m_opMutex: SetSlotVolume() calls in holding StreamSlotManager's lock,
+// which m_opMutex holders take, and Process() holds m_opMutex every tick.
 GstElement* GStreamerOutput::RefVolumeElement() {
-    std::shared_ptr<CallbackGuard> guard = m_cbGuard;
-    std::unique_lock<std::recursive_mutex> lock;
-    if (guard) {
-        lock = std::unique_lock<std::recursive_mutex>(guard->mtx);
+    std::shared_ptr<CallbackGuard> guard = m_cbGuard.load();
+    if (!guard) {
+        return nullptr;
     }
-    return m_volume ? GST_ELEMENT(gst_object_ref(m_volume)) : nullptr;
+    std::unique_lock<std::recursive_mutex> lock(guard->mtx);
+    if (!guard->self || !m_volume) {
+        return nullptr;
+    }
+    return GST_ELEMENT(gst_object_ref(m_volume));
 }
 
 void GStreamerOutput::SetVolume(int volume) {
-    if (GstElement* vol = RefVolumeElement()) {
+    TrySetVolume(volume);
+}
+
+bool GStreamerOutput::TrySetVolume(int volume) {
+    GstElement* vol = RefVolumeElement();
+    if (vol) {
         // volume parameter is 0-100 percentage
         double linearVol = volume / 100.0;
         g_object_set(vol, "volume", linearVol, NULL);
         gst_object_unref(vol);
         LogDebug(VB_MEDIAOUT, "GStreamer volume set to %d%% (%.2f)\n", volume, linearVol);
     }
+    return vol != nullptr;
 }
 
 GstElement* GStreamerOutput::MakeBranchErrorGuard() {
@@ -4943,17 +5026,18 @@ GStreamerOutput::BusCallbackScope::~BusCallbackScope() {
 }
 
 void GStreamerOutput::ConnectPadSignals(GstElement* decoder, bool wantNoMorePads) {
-    if (!decoder || !m_cbGuard)
+    std::shared_ptr<CallbackGuard> guard = m_cbGuard.load();
+    if (!decoder || !guard)
         return;
     // The closure owns its own shared_ptr to the guard, released by
     // ReleaseCallbackGuard when the signal connection dies with the decoder --
     // which can be well after this output is gone.
     g_signal_connect_data(decoder, "pad-added", G_CALLBACK(OnPadAdded),
-                          new std::shared_ptr<CallbackGuard>(m_cbGuard),
+                          new std::shared_ptr<CallbackGuard>(guard),
                           ReleaseCallbackGuard, (GConnectFlags)0);
     if (wantNoMorePads) {
         g_signal_connect_data(decoder, "no-more-pads", G_CALLBACK(OnNoMorePads),
-                              new std::shared_ptr<CallbackGuard>(m_cbGuard),
+                              new std::shared_ptr<CallbackGuard>(guard),
                               ReleaseCallbackGuard, (GConnectFlags)0);
     }
 }

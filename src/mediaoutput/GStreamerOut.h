@@ -28,7 +28,9 @@
 #include <vector>
 
 #include "AES67Manager.h"
+#include "AtomicSharedPtr.h"
 #include "DrmCards.h"
+#include "FeedSyncWindow.h"
 #include "OpusRTPManager.h"
 
 class PixelOverlayModel;
@@ -54,6 +56,10 @@ public:
     /// timeline, not for routine correction.  Returns false if the seek failed.
     bool SeekTo(float seconds);
     virtual void SetVolume(int volume) override;
+    /// SetVolume() that says whether the output took the volume: false when
+    /// it has no volume element to set -- before Start(), once its teardown
+    /// (Stop() or Close()) has begun, and for media with no sound.
+    bool TrySetVolume(int volume);
 
     /// Ask the output's owner to stop it, from a thread that doesn't own it
     /// (a command, or the slot manager stopping a playlist's background
@@ -85,6 +91,8 @@ public:
     // Make every videoconvert in `pipeline` -- including ones added later --
     // read decoded frames from padded system memory rather than straight out
     // of a hardware decoder's buffers.  See the comment at the definition.
+    // Also has each decodebin note a hardware video decoder it chooses, for
+    // the wedge ladder.
     static void GuardVideoConvertInputs(GstElement* pipeline);
 
     // The PipeWire sink a slot's audio is routed to ("" = PipeWire's default).
@@ -330,7 +338,9 @@ private:
         int busInFlight = 0;
         std::condition_variable_any busIdle;
     };
-    std::shared_ptr<CallbackGuard> m_cbGuard;
+    // Written only under m_opMutex (Start(), DetachCallbacks()), but read
+    // without it by RefVolumeElement() and from streaming threads.
+    AtomicSharedPtr<CallbackGuard> m_cbGuard;
     GstElement* RefVolumeElement();
     // Connects pad-added (and optionally no-more-pads) on `decoder`, passing a
     // guard reference as the closure data.  Takes no ref on `decoder`.
@@ -424,6 +434,7 @@ private:
     uint64_t m_feedSpeedLastMs = 0;     // when the servo last ran
     uint64_t m_feedResyncMs = 0;        // when the last resync seek was made
     bool m_feedResyncLanding = false;   // the next error is how far it landed off
+    FeedSyncWindow m_feedErrWindow;     // the last two seconds of error readings
     // How far ahead of the master a resync seek aims: what a flushing seek
     // takes to be heard again.  Learnt from each landing, for the whole run.
     static double s_feedResyncLeadS;

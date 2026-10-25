@@ -198,6 +198,12 @@ void Scheduler::CheckIfShouldBePlayingNow(int ignoreRepeat, int forceStopped) {
     {
         std::unique_lock<std::recursive_mutex> lock(m_scheduleLock);
 
+        // Idle in a switch is no stop (see Player::SwitchScope): re-armed
+        // then, the next pass pre-empts the playlist being switched to.
+        // Read after the status, as in the main loop.
+        bool idle = Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE;
+        bool switching = Player::Switching();
+
         for (auto& itemTime : m_scheduledItems) {
             if (itemTime.first > now) {
                 break; // no need to look at items that are further in the future
@@ -220,8 +226,8 @@ void Scheduler::CheckIfShouldBePlayingNow(int ignoreRepeat, int forceStopped) {
                         ir = true;
                     }
 
-                    if (((Player::INSTANCE.GetStatus() == FPP_STATUS_IDLE) ||
-                         (Player::INSTANCE.GetPlaylistName() != item.entry->playlist)) &&
+                    if (!switching &&
+                        (idle || (Player::INSTANCE.GetPlaylistName() != item.entry->playlist)) &&
                         (forceStopped != item.entryIndex) &&
                         (item.entry->repeat || ir) &&
                         !m_startsInFlight.count({ item.startTime, item.entryIndex })) {
@@ -659,6 +665,16 @@ bool Scheduler::doScheduledPlaylist(const std::time_t now, const std::time_t ite
                 return false;
             }
 
+            if (item.startTime < Player::INSTANCE.GetStartTime()) {
+                // Due before the playlist was started by hand: waiting behind
+                // the scheduled one it replaced, or a repeating entry owed a
+                // restart.  It plays once that playlist ends.  Only an entry
+                // that comes due while it plays can pre-empt it.
+                LogDebug(VB_SCHEDULE, "Scheduled playlist '%s' was due before manual playlist '%s' started, waiting for it to end\n",
+                         item.entry->playlist.c_str(), Player::INSTANCE.GetPlaylistName().c_str());
+                return false;
+            }
+
             // Check priority
             if (Player::INSTANCE.GetPriority() > item.priority) {
                 // Scheduled playlist has higher priority, stop the manual one
@@ -848,6 +864,10 @@ void Scheduler::CheckScheduledItems(bool restarted) {
                         // start rescans once it has finished.
                         if (!m_startsInFlight.empty())
                             continue;
+                        // Nor while one playlist is being replaced by another
+                        // (see Player::SwitchScope).
+                        if (Player::Switching())
+                            continue;
                         if (item.priority > bestIdlePriority)
                             continue; // a higher-priority playlist is due; it goes first
                         if (!doScheduledPlaylist(now, itemTime.first, item, restarted, actions)) {
@@ -887,6 +907,25 @@ void Scheduler::CheckScheduledItems(bool restarted) {
 
                 if (!actions.empty())
                     break;
+            }
+
+            // A switch that began after the checks above read the player
+            // idle: a start now would replace the playlist being switched to.
+            // Drop this pass's actions, and leave its start to a later one.
+            if (!actions.empty() && Player::Switching()) {
+                LogDebug(VB_SCHEDULE, "A playlist switch began, dropping this pass's scheduled actions\n");
+                for (const auto& action : actions) {
+                    if (action.type != PlayerAction::Type::StartPlaylist)
+                        continue;
+                    m_startsInFlight.erase({ action.startTime, action.entryIndex });
+                    if (auto it = m_scheduledItems.find(action.startTime); it != m_scheduledItems.end()) {
+                        for (auto& item : it->second) {
+                            if (item.isPlaylist && (item.entryIndex == action.entryIndex))
+                                SetItemRan(item, false);
+                        }
+                    }
+                }
+                actions.clear();
             }
         }
 
